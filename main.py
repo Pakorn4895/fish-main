@@ -11,10 +11,20 @@ import time
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.websockets import WebSocket, WebSocketDisconnect
 import serial.tools.list_ports
 from dotenv import load_dotenv
+from pydantic import BaseModel
+from bleak import BleakScanner, BleakClient
+
+# Global dict to hold active BLE connections
+ble_clients = {}
+
+class BleControlRequest(BaseModel):
+    action: str
+    address: str
+    name: str
 
 # โหลดค่าจากไฟล์ .env
 load_dotenv()
@@ -474,6 +484,57 @@ if os.path.isdir(dist_dir):
     app.mount("/assets", StaticFiles(directory=os.path.join(dist_dir, "assets")), name="assets")
 
     # สำหรับ Root Route (/) ส่งหน้าหลักตรง ๆ ป้องกันการซ้อนของ SPA Router 
+    @app.get("/api/bluetooth/scan")
+    async def scan_bluetooth():
+        try:
+            devices = await BleakScanner.discover(timeout=5.0)
+            results = []
+            for d in devices:
+                results.append({
+                    "name": d.name or "Unknown",
+                    "address": d.address
+                })
+            return {"devices": results}
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"error": str(e)})
+
+    @app.post("/api/bluetooth/control")
+    async def control_bluetooth(payload: BleControlRequest):
+        address = payload.address
+        action = payload.action
+        
+        CHARACTERISTIC_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+
+        if action == "connect":
+            if address not in ble_clients or not ble_clients[address].is_connected:
+                client = BleakClient(address)
+                try:
+                    await client.connect()
+                    ble_clients[address] = client
+                    return {"status": "connected"}
+                except Exception as e:
+                    return JSONResponse(status_code=500, content={"error": str(e)})
+            return {"status": "already_connected"}
+            
+        elif action == "on" or action == "off":
+            if address in ble_clients and ble_clients[address].is_connected:
+                val = b"1" if action == "on" else b"0"
+                try:
+                    await ble_clients[address].write_gatt_char(CHARACTERISTIC_UUID, val, response=True)
+                    return {"status": "success"}
+                except Exception as e:
+                    return JSONResponse(status_code=500, content={"error": str(e)})
+            else:
+                return JSONResponse(status_code=400, content={"error": "Not connected"})
+                
+        elif action == "disconnect":
+            if address in ble_clients:
+                await ble_clients[address].disconnect()
+                del ble_clients[address]
+            return {"status": "disconnected"}
+            
+        return JSONResponse(status_code=400, content={"error": "Unknown action"})
+
     @app.get("/", response_class=FileResponse)
     async def serve_index():
         return FileResponse(

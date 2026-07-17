@@ -7,7 +7,10 @@ import {
   Wind,
   Waves,
   Droplets,
-  Fish
+  Fish,
+  Bluetooth,
+  RefreshCw,
+  Search
 } from "lucide-react";
 import { Card } from "./ui/card";
 import { Badge } from "./ui/badge";
@@ -25,9 +28,26 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "./ui/alert-dialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "./ui/dialog";
 import { toast } from "sonner";
 
 type ChemicalType = "molasses" | "microbe";
+
+interface BluetoothDevice {
+  address: string;
+  name: string;
+}
+
+interface ConnectedBluetoothDevice extends BluetoothDevice {
+  status: boolean;
+}
 
 import { useSensorData } from "../hooks/useSensorData";
 import { Feeder } from "../App";
@@ -35,6 +55,10 @@ import { Feeder } from "../App";
 export default function DeviceControl({ feeders, setFeeders }: { feeders: Feeder[], setFeeders: React.Dispatch<React.SetStateAction<Feeder[]>> }) {
   const { data: sensor, isConnected, isMockMode, sendCommand } = useSensorData();
   const [autoMode, setAutoMode] = useState(false);
+  const [bluetoothDevices, setBluetoothDevices] = useState<BluetoothDevice[]>([]);
+  const [isScanning, setIsScanning] = useState(false);
+  const [connectedBluetooth, setConnectedBluetooth] = useState<ConnectedBluetoothDevice[]>([]);
+  const [isDialogOpen, setIsDialogOpen] = useState(false);
 
   // Mirror device states from live sensor data
   const devices = {
@@ -128,6 +152,74 @@ export default function DeviceControl({ feeders, setFeeders }: { feeders: Feeder
     { key: "microbeDispenser" as const, label: "เครื่องเติมจุลินทรีย์", icon: Leaf, description: "เครื่องเติมจุลินทรีย์เข้าระบบ", destructive: false },
   ];
 
+  const scanBluetooth = async () => {
+    setIsScanning(true);
+    try {
+      const res = await fetch("/api/bluetooth/scan");
+      const data = await res.json();
+      setBluetoothDevices(Array.isArray(data) ? data : data.devices || []);
+    } catch (e) {
+      toast.error("ค้นหา Bluetooth ล้มเหลว");
+    } finally {
+      setIsScanning(false);
+    }
+  };
+
+  const connectBluetooth = async (device: BluetoothDevice) => {
+    try {
+      const res = await fetch("/api/bluetooth/control", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "connect", address: device.address, name: device.name })
+      });
+      if (res.ok) {
+        toast.success(`เชื่อมต่อ ${device.name || device.address} สำเร็จ`);
+        setConnectedBluetooth(prev => {
+          if (!prev.find(d => d.address === device.address)) {
+            return [...prev, { ...device, status: true }];
+          }
+          return prev;
+        });
+        setIsDialogOpen(false);
+      } else {
+        toast.error("เชื่อมต่อล้มเหลว");
+      }
+    } catch (e) {
+      toast.error("เชื่อมต่อล้มเหลว");
+    }
+  };
+
+  const toggleBluetoothDevice = async (address: string) => {
+    if (autoMode) return;
+    
+    const device = connectedBluetooth.find(d => d.address === address);
+    if (!device) return;
+    
+    const newState = !device.status;
+    const action = newState ? "on" : "off";
+
+    try {
+      const res = await fetch("/api/bluetooth/control", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action, address, name: device.name })
+      });
+      if (res.ok) {
+        toast.success(`อุปกรณ์ ${device.name || device.address} ${newState ? "เปิด" : "ปิด"}แล้ว`);
+        setConnectedBluetooth(prev => prev.map(d => {
+          if (d.address === address) {
+            return { ...d, status: newState };
+          }
+          return d;
+        }));
+      } else {
+        toast.error("ส่งคำสั่งล้มเหลว");
+      }
+    } catch (e) {
+      toast.error("ส่งคำสั่งล้มเหลว");
+    }
+  };
+
   return (
     <div className="p-6">
       {/* Header */}
@@ -157,10 +249,50 @@ export default function DeviceControl({ feeders, setFeeders }: { feeders: Feeder
 
       {/* Device Controls */}
       <Card className="p-6 mb-6">
-        <h3 className="font-semibold text-slate-900 mb-4 flex items-center gap-2">
-          <Power className="w-5 h-5" />
-          สถานะอุปกรณ์
-        </h3>
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="font-semibold text-slate-900 flex items-center gap-2">
+            <Power className="w-5 h-5" />
+            สถานะอุปกรณ์
+          </h3>
+          <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
+            <DialogTrigger asChild>
+              <Button variant="outline" size="sm" onClick={scanBluetooth} className="flex items-center gap-2">
+                <Bluetooth className="w-4 h-4 text-blue-500" />
+                ค้นหา Bluetooth
+              </Button>
+            </DialogTrigger>
+            <DialogContent className="sm:max-w-md">
+              <DialogHeader>
+                <DialogTitle>ค้นหาอุปกรณ์ Bluetooth</DialogTitle>
+                <DialogDescription>
+                  กำลังค้นหาอุปกรณ์ที่อยู่ใกล้เคียง...
+                </DialogDescription>
+              </DialogHeader>
+              <div className="flex flex-col gap-3 mt-4 max-h-[300px] overflow-y-auto">
+                {isScanning ? (
+                  <div className="flex items-center justify-center py-8 text-slate-500">
+                    <RefreshCw className="w-6 h-6 animate-spin mr-2 text-blue-500" />
+                    กำลังสแกน...
+                  </div>
+                ) : bluetoothDevices.length > 0 ? (
+                  bluetoothDevices.map((device, idx) => (
+                    <div key={idx} className="flex items-center justify-between p-3 border rounded-lg hover:bg-slate-50">
+                      <div>
+                        <p className="font-medium text-slate-900">{device.name || "Unknown Device"}</p>
+                        <p className="text-xs text-slate-500">{device.address}</p>
+                      </div>
+                      <Button size="sm" onClick={() => connectBluetooth(device)}>เชื่อมต่อ</Button>
+                    </div>
+                  ))
+                ) : (
+                  <div className="text-center py-8 text-slate-500 border rounded-lg border-dashed">
+                    ไม่พบอุปกรณ์
+                  </div>
+                )}
+              </div>
+            </DialogContent>
+          </Dialog>
+        </div>
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
           {deviceList.map((device) => {
             const Icon = device.icon;
@@ -223,6 +355,34 @@ export default function DeviceControl({ feeders, setFeeders }: { feeders: Feeder
             )}
           </div>
 
+          {/* Connected Bluetooth Devices */}
+          {connectedBluetooth.map((device) => {
+            const isOn = device.status;
+            return (
+              <div key={device.address} className={`p-4 rounded-xl border-2 transition-all ${
+                isOn ? "bg-blue-50 border-blue-200" : "bg-slate-50 border-slate-200"
+              }`}>
+                <div className="flex items-center justify-between mb-3">
+                  <div className={`p-2 rounded-lg ${isOn ? "bg-blue-100" : "bg-slate-100"}`}>
+                    <Bluetooth className={`w-5 h-5 ${isOn ? "text-blue-600" : "text-slate-400"}`} />
+                  </div>
+                  <Switch
+                    checked={isOn}
+                    onCheckedChange={() => toggleBluetoothDevice(device.address)}
+                    disabled={autoMode}
+                  />
+                </div>
+                <p className="font-semibold text-slate-800">{device.name || "Bluetooth Device"}</p>
+                <p className="text-xs text-slate-500 mt-1">{device.address}</p>
+                <Badge
+                  variant={isOn ? "default" : "secondary"}
+                  className="mt-2"
+                >
+                  {isOn ? "ON" : "OFF"}
+                </Badge>
+              </div>
+            );
+          })}
         </div>
       </Card>
 

@@ -22,7 +22,7 @@ interface SensorContextValue {
   isConnected: boolean;       // สถานะการเชื่อมต่อกับหลังบ้าน FastAPI
   isArduinoConnected: boolean; // 🌟 สถานะฮาร์ดแวร์บอร์ด Arduino Mega จริง
   isMockMode: boolean;
-  sendCommand:
+  sendCommand: (device: string, state: boolean | number, payload?: any) => void;
 }
 
 // ─── Default Values ───────────────────────────────────────────────────────────
