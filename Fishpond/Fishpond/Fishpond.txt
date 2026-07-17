@@ -1,0 +1,1007 @@
+/*
+ * ════════════════════════════════════════════════════════════
+ * Fish Pond IoT Dashboard  ·  Arduino Mega  ·  LCD 20×4
+ * ════════════════════════════════════════════════════════════
+ * [NEW] Shadow Buffer (Smart LCD Update) - อัปเดตเฉพาะค่าที่เปลี่ยน
+ * [NEW] Double Click ที่ Encoder เพื่อเลื่อนหน้าจอไปทางขวา
+ * ════════════════════════════════════════════════════════════
+ */
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <EEPROM.h>
+#include <DHT.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+// ══════════════════════════════════════════════════════════
+//  PIN DEFINITIONS
+// ══════════════════════════════════════════════════════════
+#define PIN_ENC_SW        40
+#define PIN_ENC_DT         3
+#define PIN_ENC_CLK        2
+
+#define PIN_TURBIDITY    A10
+#define PIN_EC           A11
+#define PIN_PH           A12
+#define PIN_WATER_LEVEL  A9    // XKC-Y25-V ถังพักน้ำ ระดับบน (Digital)
+#define PIN_XKC          A8    // XKC-Y25-V ถังพักน้ำ ระดับล่าง (Digital)
+
+#define PIN_CURRENT1     A13   // ACS712 — Air Pump
+#define PIN_CURRENT2     A14   // ACS712 — Fish Pump
+#define PIN_CURRENT3     A15   // ACS712 — Filter/LED
+
+#define PIN_WATER_TEMP1  22    // DS18B20 #1 (Device Temp - อุณหภูมิในกล่อง)
+#define PIN_WATER_TEMP2  23    // DS18B20 #2 (Water Temp - อุณหภูมิน้ำ)
+
+#define PIN_DHT          26
+#define DHTTYPE          DHT21
+
+#define PIN_US_TRIG      43    // JSN-SR04T
+#define PIN_US_ECHO      42
+
+#define PIN_BUZZER       25
+
+// Relay (Active LOW)
+#define PIN_RELAY_AIR        34   // ปั๊มลม
+#define PIN_RELAY_PUMP_FISH  35   // ปั๊มน้ำ บ่อพัก→บ่อปลา
+#define PIN_RELAY_FILTER     36   // Filter + LED
+#define PIN_RELAY_FILL_TANK  31   // โซลินอยด์เติมน้ำ→บ่อพัก
+#define PIN_RELAY_DRAIN_FISH 32   // โซลินอยด์ระบายน้ำออกบ่อปลา
+#define PIN_RELAY6           33   // สำรอง
+
+// ══════════════════════════════════════════════════════════
+//  EEPROM MAP
+// ══════════════════════════════════════════════════════════
+#define EE_MAGIC          0   // byte 0xAC
+#define EE_FILTER         1   // bool
+#define EE_PUMP_FISH      2   // bool
+#define EE_AIR_PUMP       3   // bool
+#define EE_PH_LOW         4   // float 4B
+#define EE_PH_HIGH        8   // float 4B
+#define EE_EC_MAX        12   // int 2B
+#define EE_TEMP_MAX      14   // float 4B
+#define EE_FILL_LO       22   // int 2B  ระดับน้ำ (cm) ที่เริ่มเติมน้ำ (Lv Lo)
+#define EE_FILL_HI       24   // int 2B  ระดับน้ำ (cm) ที่หยุดเติมน้ำ (Lv Hi)
+#define EE_TURB_MAX      26   // int 2B  Turbidity NTU Max
+#define EE_AUTO_MODE     28   // byte 1B สถานะเปิด/ปิด Automate (1=ON, 0=OFF)
+#define EE_FILL_TANK     29   // bool สถานะ Fill Tank
+#define EE_DRAIN_PUMP    30   // bool สถานะ Drain Pump (ระบายน้ำ)
+
+// ══════════════════════════════════════════════════════════
+//  SENSOR INSTANCES
+// ══════════════════════════════════════════════════════════
+DHT               dht(PIN_DHT, DHTTYPE);
+OneWire           ow1(PIN_WATER_TEMP1);
+OneWire           ow2(PIN_WATER_TEMP2);
+DallasTemperature ts1(&ow1);
+DallasTemperature ts2(&ow2);
+
+// ══════════════════════════════════════════════════════════
+//  PAGES
+// ══════════════════════════════════════════════════════════
+#define NUM_PAGES    7
+#define PG_DASHBOARD 0
+#define PG_QUALITY   1
+#define PG_LEVEL     2
+#define PG_TEMP      3
+#define PG_CONTROLS  4
+#define PG_AUTOMATE  5
+#define PG_SETTINGS  6
+
+const char* PG_NAMES[NUM_PAGES] = {
+  "Dashboard",
+  "Water Quality",
+  "Water Level",
+  "Temperature",
+  "Controls",
+  "Automate",
+  "Settings"
+};
+
+// ══════════════════════════════════════════════════════════
+//  STATE MACHINE & LCD BUFFER
+// ══════════════════════════════════════════════════════════
+enum AppState { ST_BROWSE, ST_CAT_SELECT, ST_EDIT, ST_ADJUST };
+AppState appState = ST_BROWSE;
+int curPage  = 0;
+int prevPage = -1;
+int selItem  = 0;
+int selCat   = 0;
+
+char lcdCache[4][20]; // เก็บสถานะหน้าจอปัจจุบันสำหรับทำ Smart Update
+
+// ══════════════════════════════════════════════════════════
+//  SENSOR VALUES
+// ══════════════════════════════════════════════════════════
+float sDevTemp  = 0.0f, sWaterTemp = 0.0f;
+float sAirTemp  = 0.0f, sHumidity = 0.0f;
+float sPH       = 7.0f;
+int   sEcRaw    = 0;
+int   sTurbRaw  = 0;
+int   sTurbNtu  = 0;
+
+float sFishCm   = 0.0f;
+int   sFishLevel= 0;
+bool  sTankHigh = false;
+bool  sTankLow  = false;
+float sCurrent1 = 0.0f, sCurrent2 = 0.0f, sCurrent3 = 0.0f;
+
+// ══════════════════════════════════════════════════════════
+//  RELAY CONTROL VARIABLES (OVERRIDE SYSTEM)
+// ══════════════════════════════════════════════════════════
+bool userManualState[5] = {false, false, false, false, false};
+bool isPermManual[5]    = {false, false, false, false, false}; 
+unsigned long freezeTimer[5] = {0, 0, 0, 0, 0};
+
+// ══════════════════════════════════════════════════════════
+//  CONFIG VALUES
+// ══════════════════════════════════════════════════════════
+float cfgPhLow      = 6.5f;
+float cfgPhHigh     = 7.5f;
+int   cfgEcMax      = 800;
+float cfgTmpMax     = 35.0f;
+int   cfgFillLo     = 20;
+int   cfgFillHi     = 25;    
+int   cfgTurbMaxNtu = 50;
+
+// ══════════════════════════════════════════════════════════
+//  AUTOMATION STATE
+// ══════════════════════════════════════════════════════════
+bool  isAutoMode     = true;
+char  autoStatusDisplay[21] = "IDLE";
+bool  autoFishPumpOn = false;
+bool  autoFillTankOn = false;
+bool  autoDrainOn    = false;
+bool  watchdogOn       = false;
+float watchdogBaseline = 0.0f;
+unsigned long watchdogAt       = 0;
+#define WATCHDOG_INTERVAL 20000UL
+
+bool  alarmActive   = false;
+bool  isSnoozed     = false;
+unsigned long alarmSnoozeUntil = 0;
+char  alarmLine1[21]= "";
+char  alarmLine2[21]= "";
+char  alarmLine3[21]= "";
+
+// ══════════════════════════════════════════════════════════
+//  ENCODER & BUTTON
+// ══════════════════════════════════════════════════════════
+int           encClkLast      = HIGH;
+int           encPendingDelta = 0;
+bool          btnHeld         = false;
+unsigned long btnPressAt      = 0;
+
+bool          btnShortEvent     = false;
+bool          btnLongEvent      = false;
+bool          btnSuperLongEvent = false;
+bool          btnDoubleClickEvent = false;
+
+bool          btnSuperTriggered = false;
+
+bool          waitingForDouble = false;
+unsigned long lastBtnRelease   = 0;
+
+#define BTN_DEBOUNCE_MS   50
+#define LONG_PRESS_MS    800
+#define DOUBLE_CLICK_MS  250
+#define ENC_DEBOUNCE_MS    8
+#define ENC_ANTI_BACK_MS  80
+
+unsigned long encLastPulseAt = 0;
+int           encLastDir     = 0;
+
+// ══════════════════════════════════════════════════════════
+//  TIMING
+// ══════════════════════════════════════════════════════════
+unsigned long tSensor  = 0;
+unsigned long tDisplay = 0;
+unsigned long tAuto    = 0;
+#define SENSOR_INTERVAL  2000
+#define DISPLAY_INTERVAL  150
+#define AUTO_INTERVAL    1000
+
+// ══════════════════════════════════════════════════════════
+//  CUSTOM LCD CHARS
+// ══════════════════════════════════════════════════════════
+byte CC_AL[8]={0b00010,0b00110,0b01110,0b11110,0b01110,0b00110,0b00010,0b00000};
+byte CC_AR[8]={0b01000,0b01100,0b01110,0b01111,0b01110,0b01100,0b01000,0b00000};
+byte CC_BF[8]={0b11111,0b11111,0b11111,0b11111,0b11111,0b11111,0b11111,0b11111};
+byte CC_BE[8]={0b10101,0b00000,0b10101,0b00000,0b10101,0b00000,0b10101,0b00000};
+byte CC_DR[8]={0b00100,0b00100,0b01110,0b01110,0b11111,0b11111,0b01110,0b00000};
+byte CC_TH[8]={0b00100,0b01010,0b01010,0b01110,0b01110,0b11111,0b11111,0b01110};
+byte CC_OK[8]={0b00000,0b00001,0b00011,0b10110,0b11100,0b01000,0b00000,0b00000};
+byte CC_CU[8]={0b01000,0b01100,0b01110,0b01111,0b01110,0b01100,0b01000,0b00000};
+
+// ══════════════════════════════════════════════════════════
+//  HELPER FUNCTIONS (Smart LCD Print)
+// ══════════════════════════════════════════════════════════
+void lcdPrintRow(int row, const char* buf) {
+  int n = strlen(buf);
+  char padded[21];
+  
+  // Pad ให้ครบ 20 ตัวอักษร
+  for(int i = 0; i < 20; i++) {
+    padded[i] = (i < n) ? buf[i] : ' ';
+  }
+  padded[20] = '\0';
+
+  // เปรียบเทียบกับ Buffer เดิม อัปเดตเฉพาะตัวที่เปลี่ยน
+  for(int i = 0; i < 20; i++) {
+    if(lcdCache[row][i] != padded[i]) {
+      lcd.setCursor(i, row);
+      lcd.write(padded[i]);
+      lcdCache[row][i] = padded[i];
+    }
+  }
+}
+
+void clearLCD() {
+  lcd.clear();
+  for(int r=0; r<4; r++)
+    for(int c=0; c<20; c++)
+      lcdCache[r][c] = ' ';
+}
+
+void relayOn(int pin)  { digitalWrite(pin, LOW); }
+void relayOff(int pin) { digitalWrite(pin, HIGH); }
+void buzz(int ms)  { tone(PIN_BUZZER, 1200, ms); }
+void buzzAlarm()   { tone(PIN_BUZZER, 2000, 500); }
+
+void drawHeader(int page) {
+  const char* name = PG_NAMES[page];
+  int len  = strlen(name);
+  int padL = (16 - len) / 2;
+  int padR = 16 - len - padL;
+  char buf[21];
+  int idx = 0;
+  
+  buf[idx++] = '\x08'; // ใช้ 0x08 แทน 0x00 เพื่อให้ทำงานกับ String ได้
+  buf[idx++] = ' ';
+  for (int i = 0; i < padL; i++) buf[idx++] = ' ';
+  for (int i = 0; i < len; i++) buf[idx++] = name[i];
+  for (int i = 0; i < padR; i++) buf[idx++] = ' ';
+  buf[idx++] = ' ';
+  buf[idx++] = '\x01';
+  buf[idx] = '\0';
+  
+  lcdPrintRow(0, buf);
+}
+
+// ══════════════════════════════════════════════════════════
+//  ULTRASONIC - GET DISTANCE
+// ══════════════════════════════════════════════════════════
+float getDistance() {
+  float values[5]; 
+  int validCount = 0;
+
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(PIN_US_TRIG, LOW);
+    delayMicroseconds(2);
+    digitalWrite(PIN_US_TRIG, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(PIN_US_TRIG, LOW);
+
+    long duration = pulseIn(PIN_US_ECHO, HIGH, 30000UL); 
+    
+    if (duration > 0) {
+      float d = (duration * 0.034f / 2.0f);
+      values[validCount] = d;
+      validCount++;
+    }
+    delay(50);
+  }
+
+  if (validCount == 0) return 999.0f;
+
+  for (int i = 0; i < validCount - 1; i++) {
+    for (int j = i + 1; j < validCount; j++) {
+      if (values[i] > values[j]) {
+        float temp = values[i];
+        values[i] = values[j];
+        values[j] = temp;
+      }
+    }
+  }
+  return values[validCount / 2];
+}
+
+// ══════════════════════════════════════════════════════════
+//  ALARM OVERLAY
+// ══════════════════════════════════════════════════════════
+void setAlarm(const char* l1, const char* l2, const char* l3) {
+  if (!alarmActive) clearLCD();
+  alarmActive = true;
+  strncpy(alarmLine1, l1, 20); alarmLine1[20] = 0;
+  strncpy(alarmLine2, l2, 20); alarmLine2[20] = 0;
+  strncpy(alarmLine3, l3, 20); alarmLine3[20] = 0;
+  buzzAlarm();
+}
+
+void clearAlarm() {
+  if (!alarmActive) return;
+  alarmActive = false;
+  clearLCD();
+}
+
+void drawAlarmOverlay() {
+  lcdPrintRow(0, "*** ALARM! ***");
+  lcdPrintRow(1, alarmLine1);
+  lcdPrintRow(2, alarmLine2);
+  lcdPrintRow(3, alarmLine3);
+}
+
+// ══════════════════════════════════════════════════════════
+//  EEPROM
+// ══════════════════════════════════════════════════════════
+void loadEEPROM() {
+  if (EEPROM.read(EE_MAGIC) != 0xAC) {
+    EEPROM.write(EE_MAGIC,    0xAC);
+    EEPROM.write(EE_FILTER,   0);
+    EEPROM.write(EE_PUMP_FISH,0);
+    EEPROM.write(EE_AIR_PUMP, 0);
+    EEPROM.write(EE_FILL_TANK,0);
+    EEPROM.write(EE_DRAIN_PUMP,0);
+    EEPROM.put(EE_PH_LOW,    6.5f);
+    EEPROM.put(EE_PH_HIGH,   7.5f);
+    EEPROM.put(EE_EC_MAX,    (int)800);
+    EEPROM.put(EE_TEMP_MAX,  35.0f);
+    EEPROM.put(EE_FILL_LO,   (int)20);
+    EEPROM.put(EE_FILL_HI,   (int)25);
+    EEPROM.put(EE_TURB_MAX,  (int)50);
+  }
+  
+  userManualState[0] = (EEPROM.read(EE_FILTER)    == 1);
+  userManualState[1] = (EEPROM.read(EE_PUMP_FISH) == 1);
+  userManualState[2] = (EEPROM.read(EE_AIR_PUMP)  == 1);
+  userManualState[3] = (EEPROM.read(EE_FILL_TANK) == 1);
+  userManualState[4] = (EEPROM.read(EE_DRAIN_PUMP)== 1);
+
+  EEPROM.get(EE_PH_LOW,    cfgPhLow);
+  EEPROM.get(EE_PH_HIGH,   cfgPhHigh);
+  EEPROM.get(EE_EC_MAX,    cfgEcMax);
+  EEPROM.get(EE_TEMP_MAX,  cfgTmpMax);
+  EEPROM.get(EE_FILL_LO,   cfgFillLo);
+  EEPROM.get(EE_FILL_HI,   cfgFillHi);
+  EEPROM.get(EE_TURB_MAX,  cfgTurbMaxNtu);
+  cfgTurbMaxNtu = constrain(cfgTurbMaxNtu, 0, 3000); 
+
+  byte am = EEPROM.read(EE_AUTO_MODE);
+  if (am == 255) {
+    isAutoMode = true;
+    EEPROM.update(EE_AUTO_MODE, 1);
+  } else {
+    isAutoMode = (am == 1);
+  }
+}
+
+void saveConfig() {
+  EEPROM.put(EE_PH_LOW,    cfgPhLow);
+  EEPROM.put(EE_PH_HIGH,   cfgPhHigh);
+  EEPROM.put(EE_EC_MAX,    cfgEcMax);
+  EEPROM.put(EE_TEMP_MAX,  cfgTmpMax);
+  EEPROM.put(EE_FILL_LO,   cfgFillLo);
+  EEPROM.put(EE_FILL_HI,   cfgFillHi);
+  EEPROM.put(EE_TURB_MAX,  cfgTurbMaxNtu);
+}
+
+// ══════════════════════════════════════════════════════════
+//  APPLY RELAYS & OVERRIDES
+// ══════════════════════════════════════════════════════════
+void updateRelays() {
+  unsigned long now = millis();
+  bool finalState[5];
+  bool actualAutoFish = isAutoMode ? autoFishPumpOn : false;
+  bool actualAutoFill = isAutoMode ? autoFillTankOn : false;
+  bool actualDrain    = isAutoMode ? autoDrainOn : false;
+  
+  finalState[0] = (isPermManual[0] || now < freezeTimer[0]) ? userManualState[0] : false; 
+  finalState[1] = (isPermManual[1] || now < freezeTimer[1]) ? userManualState[1] : actualAutoFish;
+  finalState[2] = (isPermManual[2] || now < freezeTimer[2]) ? userManualState[2] : false;
+  finalState[3] = (isPermManual[3] || now < freezeTimer[3]) ? userManualState[3] : actualAutoFill;
+  finalState[4] = (isPermManual[4] || now < freezeTimer[4]) ? userManualState[4] : actualDrain;
+
+  if (actualDrain && !isPermManual[3] && now >= freezeTimer[3]) {
+    finalState[3] = true;
+  }
+
+  finalState[0] ? relayOn(PIN_RELAY_FILTER)    : relayOff(PIN_RELAY_FILTER);
+  finalState[0] ? relayOn(PIN_RELAY6)          : relayOff(PIN_RELAY6);       
+  finalState[1] ? relayOn(PIN_RELAY_PUMP_FISH) : relayOff(PIN_RELAY_PUMP_FISH);
+  finalState[2] ? relayOn(PIN_RELAY_AIR)       : relayOff(PIN_RELAY_AIR);
+  finalState[3] ? relayOn(PIN_RELAY_FILL_TANK) : relayOff(PIN_RELAY_FILL_TANK);
+  finalState[4] ? relayOn(PIN_RELAY_DRAIN_FISH): relayOff(PIN_RELAY_DRAIN_FISH); 
+  
+  if (!isPermManual[0] && now >= freezeTimer[0]) userManualState[0] = finalState[0];
+  if (!isPermManual[1] && now >= freezeTimer[1]) userManualState[1] = finalState[1];
+  if (!isPermManual[2] && now >= freezeTimer[2]) userManualState[2] = finalState[2];
+  if (!isPermManual[3] && now >= freezeTimer[3]) userManualState[3] = finalState[3];
+  if (!isPermManual[4] && now >= freezeTimer[4]) userManualState[4] = finalState[4];
+}
+
+void adcFlush(int pin, int times = 3, int waitMs = 5) {
+  for (int i = 0; i < times; i++) {
+    analogRead(pin);
+    delay(waitMs);
+  }
+}
+
+// ══════════════════════════════════════════════════════════
+//  SENSOR READING
+// ══════════════════════════════════════════════════════════
+void readSensors() {
+  sTurbRaw = analogRead(PIN_TURBIDITY);
+  int rawClear = 722;  
+  int rawDirty = 0;
+  sTurbNtu = map(sTurbRaw, rawClear, rawDirty, 0, 1000);
+  sTurbNtu = constrain(sTurbNtu, 0, 1000);
+
+  delay(20);                   
+  adcFlush(PIN_PH, 3, 10);    
+
+  long phSum = 0;
+  for (int i = 0; i < 10; i++) {
+    phSum += analogRead(PIN_PH);
+    delay(10);                 
+  }
+  float phVoltage = (phSum / 10.0f) * (5.0f / 1023.0f);
+  sPH = 7.0f + ((2.5f - phVoltage) / 0.18f);
+
+  float dist = getDistance();
+  if (dist >= 999.0f) {
+    sFishCm = 999.0f;
+    sFishLevel = 0;
+  } else {
+    sFishCm = dist - 16.0f; 
+    if (cfgFillHi > 0) {
+      sFishLevel = (int)constrain((sFishCm * 100.0f) / cfgFillHi, 0, 100);
+    } else {
+      sFishLevel = 0;
+    }
+  }
+
+  sTankLow  = (digitalRead(PIN_XKC) == LOW);
+  sTankHigh = (digitalRead(PIN_WATER_LEVEL) == HIGH);
+
+  ts1.requestTemperatures(); ts2.requestTemperatures();
+  float t1 = ts1.getTempCByIndex(0);
+  float t2 = ts2.getTempCByIndex(0);
+  if (t1 > -100.0f) sDevTemp = t1;
+  if (t2 > -100.0f) sWaterTemp = t2;
+
+  float rh = dht.readHumidity(), rt = dht.readTemperature();
+  if (!isnan(rt)) sAirTemp  = rt;
+  if (!isnan(rh)) sHumidity = rh;
+
+  const float sens = 0.185f, vOff = 2.5f;
+  auto readA = [&](int pin) -> float {
+    float v = analogRead(pin) * (5.0f / 1023.0f);
+    float c = (v - vOff) / sens;
+    c = abs(c);
+    return (c < 0.08f) ? 0.0f : c;
+  };
+  sCurrent1 = readA(PIN_CURRENT1);
+  sCurrent2 = readA(PIN_CURRENT2);
+  sCurrent3 = readA(PIN_CURRENT3);
+}
+
+// ══════════════════════════════════════════════════════════
+//  AUTOMATION LOGIC
+// ══════════════════════════════════════════════════════════
+void runAutomation() {
+  unsigned long now = millis();
+  bool newAlarm = false;
+  char aL1[21]="", aL2[21]="", aL3[21]="";
+
+  strcpy(autoStatusDisplay, "");
+
+  if (isAutoMode) {
+    if (!autoFishPumpOn && sFishCm < 999.0f && sFishCm < (float)cfgFillLo) {
+      autoFishPumpOn   = true;
+      watchdogOn       = true; watchdogBaseline = sFishCm; watchdogAt = now;
+    }
+    if (autoFishPumpOn && sFishCm >= (float)cfgFillHi) {
+      autoFishPumpOn = false;
+      watchdogOn = false;
+    }
+    
+    if (!autoFillTankOn && sTankLow && !sTankHigh) {
+      autoFillTankOn = true;
+    }
+    if (autoFillTankOn && sTankHigh) {
+      autoFillTankOn = false;
+    }
+    
+    bool ecDirty = (sEcRaw > cfgEcMax);
+    bool turbDirty = (sTurbNtu > cfgTurbMaxNtu); 
+
+    if (!autoDrainOn && (ecDirty || turbDirty)) {
+      autoDrainOn = true;
+    }
+    if (autoDrainOn && !ecDirty && !turbDirty) {
+      autoDrainOn = false;
+    }
+    
+    if (autoFishPumpOn) strcat(autoStatusDisplay, "FPond ");
+    if (autoDrainOn)    strcat(autoStatusDisplay, "Drain ");
+    if (autoFillTankOn) strcat(autoStatusDisplay, "FTank ");
+    if (autoStatusDisplay[0] == '\0') strcpy(autoStatusDisplay, "IDLE");
+  } else {
+    strcpy(autoStatusDisplay, "SYSTEM OFF");
+  }
+
+  updateRelays();
+
+  bool phOk = (sPH >= cfgPhLow && sPH <= cfgPhHigh);
+  bool ecOk = (sEcRaw <= cfgEcMax);
+  bool pumpAlarm = false;
+
+  if (watchdogOn && (now - watchdogAt) >= WATCHDOG_INTERVAL) {
+    float delta = sFishCm - watchdogBaseline;
+    watchdogAt = now;
+    watchdogBaseline = sFishCm;
+    if (delta < 0.5f) { 
+      pumpAlarm = true;
+      if (!newAlarm) {
+        strcpy(aL1, "!! PUMP ERROR !!");
+        strcpy(aL2, "Pump ON, no rise");
+        newAlarm = true;
+      }
+    }
+  }
+
+  if (!phOk && !newAlarm) {
+    strcpy(aL1, "!! pH ALERT !!");
+    char phBuf[5]; dtostrf(sPH, 4, 2, phBuf);
+    snprintf(aL2, 21, "pH %s: %s", (sPH < cfgPhLow) ? "LOW " : "HIGH", phBuf);
+    newAlarm = true;
+  }
+  
+  if (!ecOk && !newAlarm) {
+    strcpy(aL1, "!! EC ALERT !!");
+    snprintf(aL2, 21, "EC HIGH: %d", sEcRaw);
+    newAlarm = true;
+  }
+
+  if (isSnoozed) {
+    if (millis() >= alarmSnoozeUntil) isSnoozed = false;
+    else newAlarm = false;
+  }
+
+  if (newAlarm) setAlarm(aL1, aL2, aL3);
+  else if (alarmActive && phOk && ecOk && !pumpAlarm) clearAlarm();
+}
+
+// ══════════════════════════════════════════════════════════
+//  ENCODER POLLING (With Double Click Logic)
+// ══════════════════════════════════════════════════════════
+void pollEncoder() {
+  unsigned long now = millis();
+  int clkNow = digitalRead(PIN_ENC_CLK);
+  if ((encClkLast == LOW) && (clkNow == HIGH)) {
+    if ((now - encLastPulseAt) >= ENC_DEBOUNCE_MS) {
+      int dir = (digitalRead(PIN_ENC_DT) == LOW) ? +1 : -1;
+      bool tooFast = (encLastDir != 0) && (dir != encLastDir) && ((now - encLastPulseAt) < ENC_ANTI_BACK_MS);
+      if (!tooFast) {
+        encPendingDelta += dir;
+        encLastDir = dir;
+        encLastPulseAt = now;
+      }
+    }
+  }
+  encClkLast = clkNow;
+
+  bool btnDown = (digitalRead(PIN_ENC_SW) == LOW);
+  if (btnDown && !btnHeld && (now - btnPressAt) > BTN_DEBOUNCE_MS) {
+    btnHeld = true;
+    btnPressAt = now; 
+    btnSuperTriggered = false;
+  }
+  if (btnDown && btnHeld && !btnSuperTriggered && (now - btnPressAt) >= 3000UL) {
+    btnSuperLongEvent = true;
+    btnSuperTriggered = true;
+    buzz(500);
+  }
+  
+  // Logic การปล่อยปุ่ม
+  if (!btnDown && btnHeld) {
+    btnHeld = false;
+    unsigned long d = now - btnPressAt;
+    if (!btnSuperTriggered) {
+      if (d >= LONG_PRESS_MS) {
+        btnLongEvent = true;
+        waitingForDouble = false;
+      } else {
+        // [NEW] เช็คว่าอยู่ในช่วงจับเวลา Double Click ไหม
+        if (waitingForDouble && (now - lastBtnRelease < DOUBLE_CLICK_MS)) {
+          btnDoubleClickEvent = true;
+          waitingForDouble = false;
+        } else {
+          waitingForDouble = true;
+          lastBtnRelease = now;
+        }
+      }
+    }
+  }
+
+  // หากรอ Double Click จนหมดเวลา -> ถือว่าเป็น Short Click ปกติ
+  if (waitingForDouble && (now - lastBtnRelease >= DOUBLE_CLICK_MS)) {
+    btnShortEvent = true;
+    waitingForDouble = false;
+  }
+}
+
+// ══════════════════════════════════════════════════════════
+//  INPUT HANDLING
+// ══════════════════════════════════════════════════════════
+void handleInput() {
+  // [NEW] จัดการ Double Click
+  if (btnDoubleClickEvent) {
+    btnDoubleClickEvent = false;
+    if (appState == ST_BROWSE) {
+      curPage = (curPage + 1) % NUM_PAGES;
+      selItem = 0; 
+      buzz(30); delay(40); buzz(30);
+      clearLCD(); // เคลียร์ Cache จอเวลาเปลี่ยนหน้า
+    }
+    return;
+  }
+
+  if (btnLongEvent) {
+    btnLongEvent = false;
+    if (alarmActive) clearAlarm();
+    else if (appState != ST_BROWSE){ appState=ST_BROWSE; selItem=0; buzz(100); clearLCD(); }
+    encPendingDelta = 0;
+    return;
+  }
+  if (btnSuperLongEvent) {
+    btnSuperLongEvent = false;
+    if (appState == ST_EDIT && curPage == PG_CONTROLS && selItem < 5) {
+        isPermManual[selItem] = !isPermManual[selItem];
+        if (!isPermManual[selItem]) freezeTimer[selItem] = 0;
+        updateRelays();
+        buzz(150); 
+    }
+    return;
+  }
+  if (btnShortEvent && alarmActive) {
+    btnShortEvent = false;
+    isSnoozed = true;
+    alarmSnoozeUntil = millis() + 20000UL;
+    clearAlarm(); buzz(100);
+    return;
+  }
+  if (appState == ST_BROWSE) {
+    if (encPendingDelta != 0) {
+      curPage = (curPage + (encPendingDelta>0?1:-1) + NUM_PAGES) % NUM_PAGES;
+      encPendingDelta = 0; selItem = 0; buzz(20);
+      clearLCD();
+    }
+    if (btnShortEvent) {
+      btnShortEvent = false;
+      if (curPage == PG_CONTROLS || curPage == PG_AUTOMATE) { appState=ST_EDIT; selItem=0; buzz(40); }
+      else if (curPage == PG_SETTINGS) { appState=ST_CAT_SELECT; selCat=0; buzz(40); clearLCD(); }
+    }
+  }
+  else if (appState == ST_CAT_SELECT) {
+    if (encPendingDelta != 0) {
+      selCat = (selCat + (encPendingDelta>0?1:-1) + 4) % 4;
+      encPendingDelta = 0;
+    }
+    if (btnShortEvent) {
+      btnShortEvent=false; buzz(40);
+      if (selCat==3) { saveConfig(); appState=ST_BROWSE; clearLCD(); }
+      else { appState=ST_EDIT; selItem=0; clearLCD(); }
+    }
+  }
+  else if (appState == ST_EDIT) {
+    int maxItems = (curPage == PG_CONTROLS) ? 6 : (curPage == PG_AUTOMATE ? 2 : (selCat==0 ? 5 : (selCat==1 ? 2 : 3)));
+    if (encPendingDelta!=0) {
+      selItem=(selItem+(encPendingDelta>0?1:-1)+maxItems)%maxItems;
+      encPendingDelta=0;
+    }
+    if (btnShortEvent) {
+      btnShortEvent=false; buzz(40);
+      if (curPage==PG_CONTROLS) {
+        if (selItem==5) { appState=ST_BROWSE; selItem=0; clearLCD(); } 
+        else {
+          userManualState[selItem] = !userManualState[selItem];
+          freezeTimer[selItem] = millis() + 20000UL;
+          updateRelays();
+          if(selItem == 0) EEPROM.update(EE_FILTER, userManualState[0]);
+          if(selItem == 2) EEPROM.update(EE_AIR_PUMP, userManualState[2]);
+          if(selItem == 4) EEPROM.update(EE_DRAIN_PUMP, userManualState[4]); 
+        }
+      } else if (curPage==PG_AUTOMATE) {
+        if (selItem==1) { appState=ST_BROWSE; selItem=0; clearLCD(); }
+        else if (selItem==0) { isAutoMode = !isAutoMode; EEPROM.update(EE_AUTO_MODE, isAutoMode); updateRelays(); }
+      } else if (curPage==PG_SETTINGS) {
+        if ((selCat==0&&selItem==4)||(selCat==1&&selItem==1)||(selCat==2&&selItem==2)) { appState=ST_CAT_SELECT; clearLCD(); }
+        else appState=ST_ADJUST;
+      }
+    }
+  }
+  else if (appState==ST_ADJUST) {
+    if (encPendingDelta!=0) {
+      int d=(encPendingDelta>0)?1:-1;
+      if (selCat==0) {
+        if (selItem==0) cfgPhLow  =constrain(cfgPhLow  +d*0.1f, 0, 14);
+        if (selItem==1) cfgPhHigh =constrain(cfgPhHigh +d*0.1f, 0, 14);
+        if (selItem==2) cfgEcMax  =constrain(cfgEcMax  +d*10, 0, 1023);
+        if (selItem==3) cfgTurbMaxNtu=constrain(cfgTurbMaxNtu+d*10, 0, 3000); 
+      } else if (selCat==1) {
+        if (selItem==0) cfgTmpMax=constrain(cfgTmpMax+d*0.5f, 0, 60);
+      } else if (selCat==2) {
+        if (selItem==0) cfgFillLo =constrain(cfgFillLo + d, 0, cfgFillHi - 1);
+        if (selItem==1) cfgFillHi =constrain(cfgFillHi + d, cfgFillLo + 1, 300);
+      }
+      encPendingDelta=0;
+    }
+    if (btnShortEvent) { btnShortEvent=false; saveConfig(); appState=ST_EDIT; buzz(60); }
+  }
+}
+
+// ══════════════════════════════════════════════════════════
+//  PAGE DRAW FUNCTIONS (Smart LCD Enabled)
+// ══════════════════════════════════════════════════════════
+void drawDashboard() {
+  drawHeader(PG_DASHBOARD);
+  char buf[21], w1[6], w2[6], phB[6], at[6];
+  
+  dtostrf(sDevTemp, 4, 1, w1); dtostrf(sWaterTemp, 4, 1, w2);
+  snprintf(buf, 21, "\x05" "Dev:%s\xDF Wt:%s\xDF""C", w1, w2);
+  lcdPrintRow(1, buf);
+  
+  dtostrf(sPH, 4, 2, phB);
+  snprintf(buf, 21, "\x04pH:%s EC:%4d   ", phB, sEcRaw);
+  lcdPrintRow(2, buf);
+  
+  dtostrf(sAirTemp, 4, 1, at);
+  snprintf(buf, 21, "Air:%s\xDF""C H:%3d%%  ", at, (int)sHumidity);
+  lcdPrintRow(3, buf);
+}
+
+void drawWaterQuality() {
+  drawHeader(PG_QUALITY);
+  char buf[21], phB[6];
+  dtostrf(sPH, 4, 2, phB);
+  snprintf(buf, 21, "\x04 pH: %s %s   ", phB, (sPH >= cfgPhLow && sPH <= cfgPhHigh) ? "[OK ]" : "[BAD]");
+  lcdPrintRow(1, buf);
+  snprintf(buf, 21, " EC: %4d %s    ", sEcRaw, (sEcRaw <= cfgEcMax) ? "[OK ]" : "[HI!]");
+  lcdPrintRow(2, buf);
+  snprintf(buf, 21, " Tb:%4d NTU  %s ", sTurbNtu, (sTurbNtu <= cfgTurbMaxNtu) ? "[OK ]" : "[HI!]");
+  lcdPrintRow(3, buf);
+}
+
+void drawWaterLevel() {
+  drawHeader(PG_LEVEL);
+  char buf[21];
+  char bar[9];
+  int filled = ((long)sFishLevel * 8) / 100;
+  for(int i = 0; i < 8; i++) bar[i] = (i < filled) ? '\x02' : '\x03';
+  bar[8] = '\0';
+  
+  snprintf(buf, 21, "Pond[%s] %3d%% ", bar, sFishLevel);
+  lcdPrintRow(1, buf);
+  
+  if (sFishCm >= 999.0f) { lcdPrintRow(2, "Lv: --.-cm [---]    "); }
+  else {
+    char cmB[6]; dtostrf(sFishCm, 4, 1, cmB);
+    const char* stat = (sFishCm < (float)cfgFillLo) ? "[LOW!]" : (sFishCm >= (float)cfgFillHi ? "[FULL]" : "[ OK ]");
+    snprintf(buf, 21, "Lv:%scm %s    ", cmB, stat); lcdPrintRow(2, buf);
+  }
+  const char* tStat = sTankHigh ? "[FULL]" : (!sTankLow ? "[ OK ]" : "[LOW!]");
+  snprintf(buf, 21, "Tk:H:%c L:%c %s   ", sTankHigh ? '+' : '-', sTankLow  ? '-' : '+', tStat);
+  lcdPrintRow(3, buf);
+}
+
+void drawTemperature() {
+  drawHeader(PG_TEMP);
+  char buf[21], w1[6], w2[6], at[6];
+  dtostrf(sDevTemp, 4, 1, w1); dtostrf(sWaterTemp, 4, 1, w2); dtostrf(sAirTemp, 4, 1, at);
+  snprintf(buf, 21, "\x05 Dev   :%s\xDF""C     ", w1); lcdPrintRow(1, buf);
+  snprintf(buf, 21, "\x05 Water :%s\xDF""C     ", w2); lcdPrintRow(2, buf);
+  snprintf(buf, 21, "Air:%s\xDF""C H:%3d%%   ", at, (int)sHumidity); lcdPrintRow(3, buf);
+}
+
+void drawControls() {
+  drawHeader(PG_CONTROLS);
+  const char* labels[6] = { "Filter+LED", "Fish Pump ", "Air Pump  ", "Fill Tank ", "Drain Pump", "Quit      " };
+  
+  int start = 0;
+  if (selItem > 2) start = selItem - 2;
+  if (start > 3) start = 3; 
+
+  for (int i = 0; i < 3; i++) {
+    int idx = start + i;
+    char buf[21];
+    if (idx >= 6) { lcdPrintRow(i + 1, "                    "); continue; }
+    
+    char cur = (appState == ST_EDIT && selItem == idx) ? '\x07' : ' ';
+    if (idx < 5) {
+      bool st = userManualState[idx], isP = isPermManual[idx], isF = (!isP && millis() < freezeTimer[idx]);
+      const char* mode = isP ? (st ? "[ON M] " : "[OFF M]") : (isF ? (st ? "[ON F] " : "[OFF F]") : (st ? "[ON A] " : "[OFF A]"));
+      snprintf(buf, 21, "%c%s %s", cur, labels[idx], mode);
+    } else {
+      snprintf(buf, 21, "%c%s", cur, labels[idx]);
+    }
+    lcdPrintRow(i + 1, buf);
+  }
+}
+
+void drawAutomate() {
+  drawHeader(PG_AUTOMATE);
+  char buf[21];
+  char c0 = (appState == ST_EDIT && selItem == 0) ? '\x07' : ' ';
+  snprintf(buf, 21, "%cAuto Mode: %s ", c0, isAutoMode ? "[ON ]" : "[OFF]"); lcdPrintRow(1, buf);
+  
+  char c1 = (appState == ST_EDIT && selItem == 1) ? '\x07' : ' ';
+  snprintf(buf, 21, "%cQuit               ", c1); lcdPrintRow(2, buf);
+  
+  snprintf(buf, 21, "S:%s", autoStatusDisplay); lcdPrintRow(3, buf);
+}
+
+void drawSettings() {
+  drawHeader(PG_SETTINGS);
+  char buf[21];
+  if (appState == ST_BROWSE || appState == ST_CAT_SELECT) {
+    const char* cats[4] = { "Water Config","Temp Config","Pond Config","Save & Quit " };
+    int start = (selCat > 2) ? 1 : 0;
+    for (int i = 0; i < 3; i++) {
+      int idx = start + i; 
+      if (idx >= 4) { lcdPrintRow(i + 1, "                    "); continue; }
+      char cur = (appState == ST_CAT_SELECT && selCat == idx) ? '\x07' : ' ';
+      snprintf(buf, 21, "%c%s", cur, cats[idx]);
+      lcdPrintRow(i + 1, buf);
+    }
+    return;
+  }
+  
+  struct Item { const char* lbl; bool isBack; bool isFloat; float fv; int iv; const char* unit; };
+  auto printSettingRow = [&](int row, const Item& it, bool active, bool editing) {
+    char cur = editing ? '>' : (active ? '\x07' : ' ');
+    if (it.isBack) {
+        snprintf(buf, 21, "%c%s           ", cur, it.lbl);
+    }
+    else if (it.isFloat) { 
+        char fb[6]; dtostrf(it.fv, 5, 1, fb); 
+        snprintf(buf, 21, "%c%-7s:%s%s", cur, it.lbl, fb, it.unit);
+    }
+    else { 
+        snprintf(buf, 21, "%c%-7s:%4d%s", cur, it.lbl, it.iv, it.unit); 
+    }
+    lcdPrintRow(row, buf);
+  };
+  
+  if (selCat == 0) {
+    Item items[5] = { {"pH Low",0,1,cfgPhLow,0," pH"},{"pH High",0,1,cfgPhHigh,0," pH"},{"EC Max",0,0,0,cfgEcMax," raw"},{"TurbMax",0,0,0,cfgTurbMaxNtu," NTU"},{"Back",1,0,0,0,""} };
+    int start = (selItem > 2) ? 2 : 0;
+    for (int i = 0; i < 3; i++) { int idx = start+i; if(idx<5) printSettingRow(i+1, items[idx], selItem==idx, appState==ST_ADJUST && selItem==idx); }
+  } else if (selCat == 1) {
+    Item items[2] = { {"Tmp Max",0,1,cfgTmpMax,0," \xDFC"},{"Back",1,0,0,0,""} };
+    for (int i = 0; i < 2; i++) printSettingRow(i+1, items[i], selItem==i, appState==ST_ADJUST && selItem==i);
+  } else if (selCat == 2) {
+    Item items[3] = { {"Lv Lo",0,0,0,cfgFillLo," cm"},{"Lv Hi",0,0,0,cfgFillHi," cm"},{"Back",1,0,0,0,""} };
+    for (int i = 0; i < 3; i++) printSettingRow(i+1, items[i], selItem==i, appState==ST_ADJUST && selItem==i);
+  }
+}
+
+// ══════════════════════════════════════════════════════════
+//  SETUP & LOOP
+// ══════════════════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+
+  Wire.begin();
+  Wire.setWireTimeout(3000, true); 
+
+  lcd.init(); lcd.backlight();
+  
+  // สร้าง Cache พื้นที่ว่างจำลองสถานะจอเพื่อกันบั๊กตอน Boot
+  for(int r=0; r<4; r++)
+    for(int c=0; c<20; c++)
+      lcdCache[r][c] = ' ';
+
+  // [NEW] ปรับแก้ Custom Character ตำแหน่ง 0 ให้เป็น 8 
+  lcd.createChar(8, CC_AL); lcd.createChar(1, CC_AR); lcd.createChar(2, CC_BF);
+  lcd.createChar(3, CC_BE); lcd.createChar(4, CC_DR); lcd.createChar(5, CC_TH);
+  lcd.createChar(6, CC_OK); lcd.createChar(7, CC_CU);
+  
+  pinMode(PIN_ENC_SW,  INPUT_PULLUP); pinMode(PIN_ENC_DT,  INPUT_PULLUP); pinMode(PIN_ENC_CLK, INPUT_PULLUP);
+  pinMode(PIN_XKC, INPUT); pinMode(PIN_WATER_LEVEL, INPUT); pinMode(PIN_US_TRIG, OUTPUT); pinMode(PIN_US_ECHO, INPUT); pinMode(PIN_BUZZER, OUTPUT);
+  
+  const int relays[] = { PIN_RELAY_AIR, PIN_RELAY_PUMP_FISH, PIN_RELAY_FILTER, PIN_RELAY_FILL_TANK, PIN_RELAY_DRAIN_FISH, PIN_RELAY6 };
+  for (int r : relays) { pinMode(r, OUTPUT); relayOff(r); }
+  
+  ts1.begin(); ts2.begin(); dht.begin();
+  loadEEPROM();
+  
+  for (int i = 0; i < 5; i++) userManualState[i] = false;
+  
+  updateRelays();
+  lcd.clear(); lcd.setCursor(3, 1); lcd.print(F("Fish Pond IoT")); delay(1000); clearLCD();
+}
+
+// --- NEW: Serial Communication for Raspberry Pi ---
+void sendSerialData() {
+  Serial.print("{");
+  Serial.print("\"temp\":"); Serial.print(sWaterTemp);
+  Serial.print(",\"ph\":"); Serial.print(sPH);
+  Serial.print(",\"turbidity\":"); Serial.print(sTurbNtu);
+  Serial.print(",\"level\":"); Serial.print(sFishCm);
+  // Add relay states (0 = ON for Active Low, 1 = OFF)
+  Serial.print(",\"filter\":"); Serial.print(!digitalRead(PIN_RELAY_FILTER)); 
+  Serial.print(",\"airPump\":"); Serial.print(!digitalRead(PIN_RELAY_AIR));
+  Serial.print(",\"waterPump\":"); Serial.print(!digitalRead(PIN_RELAY_PUMP_FISH));
+  Serial.println("}");
+}
+
+void handleSerialInput() {
+  if (Serial.available() > 0) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    
+    if (input.indexOf("airPump") >= 0) {
+      bool st = (input.indexOf("true") >= 0);
+      userManualState[2] = st;
+      isPermManual[2] = true;
+      freezeTimer[2] = 0;
+      updateRelays();
+    }
+    if (input.indexOf("waterPump") >= 0) {
+      bool st = (input.indexOf("true") >= 0);
+      userManualState[1] = st;
+      isPermManual[1] = true;
+      freezeTimer[1] = 0;
+      updateRelays();
+    }
+    if (input.indexOf("filter") >= 0) {
+      bool st = (input.indexOf("true") >= 0);
+      userManualState[0] = st;
+      isPermManual[0] = true;
+      freezeTimer[0] = 0;
+      updateRelays();
+    }
+  }
+}
+// ----------------------------------------------
+
+void loop() {
+  pollEncoder();
+  unsigned long now = millis();
+  
+  // NEW: Handle incoming serial commands from Pi
+  handleSerialInput();
+  
+  if (now - tSensor >= SENSOR_INTERVAL) { tSensor = now; readSensors(); }
+  if (now - tAuto >= AUTO_INTERVAL) { tAuto = now; runAutomation(); }
+  
+  // NEW: Send Data to Pi every 2 seconds
+  static unsigned long tSerial = 0;
+  if (now - tSerial >= 2000) {
+    tSerial = now;
+    sendSerialData();
+  }
+
+  handleInput();
+  if (curPage != prevPage) { if (!alarmActive) clearLCD(); prevPage = curPage; appState = ST_BROWSE; selItem = 0; }
+  
+  if (now - tDisplay >= DISPLAY_INTERVAL) {
+    tDisplay = now;
+    if (alarmActive) drawAlarmOverlay();
+    else {
+      switch (curPage) {
+        case PG_DASHBOARD: drawDashboard(); break;
+        case PG_QUALITY:   drawWaterQuality(); break;
+        case PG_LEVEL:     drawWaterLevel();   break;
+        case PG_TEMP:      drawTemperature();  break;
+        case PG_CONTROLS:  drawControls();     break;
+        case PG_AUTOMATE:  drawAutomate();     break;
+        case PG_SETTINGS:  drawSettings();     break;
+      }
+    }
+  }
+}
