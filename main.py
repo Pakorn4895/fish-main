@@ -455,6 +455,9 @@ async def websocket_endpoint(websocket: WebSocket):
                         if "buzzer" in cmd_data:
                             is_muted = cmd_data['buzzer']
                             serial_cmd = "MUTE_ON\n" if is_muted else "MUTE_OFF\n"
+                        elif cmd_data.get("device") == "buzzer":
+                            is_muted = cmd_data.get("state")
+                            serial_cmd = "MUTE_ON\n" if is_muted else "MUTE_OFF\n"
                         else:
                             serial_cmd = json.dumps(cmd_data) + "\n"
                         

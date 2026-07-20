@@ -67,7 +67,7 @@ export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [authPage, setAuthPage] = useState<"login" | "register">("login");
   const [currentPage, setCurrentPage] = useState<Page>("overview");
-  const { data: sensor, isConnected, isMockMode, isArduinoConnected } = useSensorData();
+  const { data: sensor, isConnected, isMockMode, isArduinoConnected, sendCommand } = useSensorData();
 
   const [feeders, setFeeders] = useState<Feeder[]>(() => {
     const saved = localStorage.getItem("biofloc_feeders");

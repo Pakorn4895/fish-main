@@ -15,7 +15,7 @@ interface SettingsPageProps {
   reservoir: Reservoir;
   setReservoir: (reservoir: Reservoir) => void;
   onLogout: () => void;
-  socket: WebSocket | null; // เพิ่ม Props สำหรับรับค่า WebSocket จาก App.tsx
+  sendCommand: (device: string, state: boolean | number, payload?: any) => void;
 }
 
 export default function SettingsPage({
@@ -25,7 +25,7 @@ export default function SettingsPage({
   reservoir,
   setReservoir,
   onLogout,
-  socket
+  sendCommand
 }: SettingsPageProps) {
   const selectedPond = ponds.find(p => p.id === selectedPondId);
   const [formData, setFormData] = useState<Pond>(selectedPond || ponds[0]);
@@ -72,23 +72,17 @@ export default function SettingsPage({
   const handleToggleBuzzer = (checked: boolean) => {
     setIsMuted(checked);
 
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      const payload = {
-        action: "controlDevice",
-        data: {
-          buzzer: checked // true = ปิดเสียง (Mute), false = เปิดเสียงปกติ
-        }
-      };
-      socket.send(JSON.stringify(payload));
+    try {
+      sendCommand("buzzer", checked);
 
       toast.success(checked ? "ปิดเสียงแจ้งเตือนบนบอร์ด (Muted)" : "เปิดระบบเสียงแจ้งเตือนปกติ", {
         description: checked
           ? "เสียงเตือนไซเรนเงียบลงชั่วคราวแล้ว แต่ระบบยังแจ้งเตือนผ่านหน้าจอและ LINE ตามปกติ"
           : "ระบบพร้อมส่งเสียงไซเรนบนบอร์ดเมื่อตรวจพบค่าวิกฤต"
       });
-    } else {
+    } catch (err) {
       toast.error("ไม่สามารถส่งคำสั่งได้", {
-        description: "WebSocket ขาดการติดต่อ กรุณารอสักครู่หรือรีเฟรชหน้าเว็บ"
+        description: "เกิดข้อผิดพลาดในการส่งคำสั่ง กรุณาลองใหม่อีกครั้ง"
       });
       // คืนค่า Switch กลับไปเป็นแบบเดิมหากส่งข้อมูลไม่สำเร็จ
       setIsMuted(!checked);
