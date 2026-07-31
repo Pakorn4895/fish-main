@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import {
   LineChart,
   Line,
@@ -22,22 +22,6 @@ import {
   DialogTrigger,
 } from "./ui/dialog";
 
-// Generate hourly data for a given date (mock)
-function generateHourlyData(date: string) {
-  const data = [];
-  for (let h = 0; h < 24; h++) {
-    const hour = h.toString().padStart(2, "0") + ":00";
-    data.push({
-      time: hour,
-      pH: +(7.0 + Math.sin(h / 4) * 0.3 + Math.random() * 0.05).toFixed(2),
-      DO: +(5.5 + Math.sin(h / 3 + 1) * 0.8 + Math.random() * 0.1).toFixed(2),
-      temp: +(28 + Math.sin(h / 6) * 1.5 + Math.random() * 0.2).toFixed(1),
-      turbidity: +(115 + Math.sin(h / 5) * 10 + Math.random() * 3).toFixed(0),
-      ec: +(1.2 + Math.sin(h / 8) * 0.1 + Math.random() * 0.02).toFixed(2),
-    });
-  }
-  return data;
-}
 
 const METRICS = [
   { key: "pH", label: "pH", color: "#3b82f6", unit: "" },
@@ -54,7 +38,29 @@ export default function Analytics() {
   const [exportFrom, setExportFrom] = useState(today);
   const [exportTo, setExportTo] = useState(today);
 
-  const data = generateHourlyData(selectedDate);
+  const [data, setData] = useState<any[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+
+  useEffect(() => {
+    const fetchData = async () => {
+      setIsLoading(true);
+      try {
+        const url = import.meta.env.DEV 
+          ? `http://localhost:8000/api/analytics?date=${selectedDate}`
+          : `/api/analytics?date=${selectedDate}`;
+        const response = await fetch(url);
+        if (response.ok) {
+          const result = await response.json();
+          setData(result);
+        }
+      } catch (err) {
+        console.error("Error fetching analytics data", err);
+      } finally {
+        setIsLoading(false);
+      }
+    };
+    fetchData();
+  }, [selectedDate]);
 
   const toggleMetric = (key: string) => {
     setSelectedMetrics(prev =>
@@ -160,7 +166,7 @@ export default function Analytics() {
         <h3 className="font-semibold text-slate-900 mb-1">
           ข้อมูลคุณภาพน้ำ — {new Date(selectedDate + "T12:00:00").toLocaleDateString("th-TH", { year: "numeric", month: "long", day: "numeric" })}
         </h3>
-        <p className="text-sm text-slate-500 mb-6">แสดงค่าทุกชั่วโมง (24 ชั่วโมง)</p>
+        <p className="text-sm text-slate-500 mb-6">แสดงค่าแบบละเอียด (รายนาที)</p>
         {selectedMetrics.length === 0 ? (
           <div className="flex items-center justify-center h-64 text-slate-400">
             <p>เลือกพารามิเตอร์ที่ต้องการแสดง</p>
@@ -214,10 +220,10 @@ export default function Analytics() {
       {/* Summary stats for selected date */}
       <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mt-6">
         {METRICS.map(m => {
-          const values = data.map(d => d[m.key as keyof typeof d] as number);
-          const avg = (values.reduce((a, b) => a + b, 0) / values.length).toFixed(2);
-          const min = Math.min(...values).toFixed(2);
-          const max = Math.max(...values).toFixed(2);
+          const values = data.map(d => d[m.key as keyof typeof d]).filter(v => v !== null && v !== undefined) as number[];
+          const avg = values.length > 0 ? (values.reduce((a, b) => a + b, 0) / values.length).toFixed(2) : "-";
+          const min = values.length > 0 ? Math.min(...values).toFixed(2) : "-";
+          const max = values.length > 0 ? Math.max(...values).toFixed(2) : "-";
           return (
             <Card key={m.key} className="p-4">
               <div className="w-3 h-3 rounded-full mb-2" style={{ backgroundColor: m.color }} />

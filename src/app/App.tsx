@@ -55,6 +55,8 @@ export interface Reservoir {
 }
 
 export interface Feeder {
+  isBluetooth?: boolean;
+  address?: string;
   id: string;
   name: string;
   status: boolean; // true = ON, false = OFF
@@ -63,11 +65,21 @@ export interface Feeder {
   lastFed?: string; // e.g. "14:00 น."
 }
 
+export interface BluetoothDevice {
+  address: string;
+  name: string;
+}
+
+export interface ConnectedBluetoothDevice extends BluetoothDevice {
+  status: boolean;
+}
+
 export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [authPage, setAuthPage] = useState<"login" | "register">("login");
   const [currentPage, setCurrentPage] = useState<Page>("overview");
   const { data: sensor, isConnected, isMockMode, isArduinoConnected, sendCommand } = useSensorData();
+  const [connectedBluetooth, setConnectedBluetooth] = useState<ConnectedBluetoothDevice[]>([]);
 
   const [feeders, setFeeders] = useState<Feeder[]>(() => {
     const saved = localStorage.getItem("biofloc_feeders");
@@ -371,8 +383,20 @@ export default function App() {
           {currentPage === "overview" && <Overview pond={selectedPond} reservoir={reservoir} feeders={feeders} />}
           {currentPage === "water-quality" && <WaterQuality />}
           {currentPage === "analytics" && <Analytics />}
-          {currentPage === "feeding" && <Feeding feeders={feeders} setFeeders={setFeeders} />}
-          {currentPage === "device-control" && <DeviceControl feeders={feeders} setFeeders={setFeeders} />}
+          {currentPage === "feeding" && (
+            <Feeding 
+              feeders={feeders} 
+              setFeeders={setFeeders} 
+              connectedBluetooth={connectedBluetooth}
+              setConnectedBluetooth={setConnectedBluetooth}
+            />
+          )}
+          {currentPage === "device-control" && (
+            <DeviceControl 
+              feeders={feeders} 
+              setFeeders={setFeeders} 
+            />
+          )}
           {currentPage === "alerts" && <Alerts alerts={alerts} setAlerts={setAlerts} />}
           {currentPage === "settings" && (
             <SettingsPage

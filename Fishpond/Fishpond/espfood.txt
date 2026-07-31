@@ -1,0 +1,208 @@
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+
+// =======================
+// Stepper Motor
+// =======================
+const int dirPin = 23;
+const int stepPin = 22;
+
+const int stepsPerRev = 200;
+
+
+// =======================
+// BLE
+// =======================
+#define DEVICE_NAME "Biofloc_Motor_01"
+
+#define SERVICE_UUID        "4fa87100-873e-10c5-a854-075059a4c500"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+
+
+BLEAdvertising *pAdvertising;
+
+bool deviceConnected = false;
+bool isMotorRunning = false; // ตัวแปรเก็บสถานะการหมุนมอเตอร์
+
+
+// =======================
+// ฟังก์ชันหมุนมอเตอร์
+// =======================
+void stepMotor()
+{
+    digitalWrite(dirPin, HIGH);   // ทิศทางการหมุน
+
+    for(int i = 0; i < stepsPerRev; i++)
+    {
+        digitalWrite(stepPin, HIGH);
+        delayMicroseconds(2000);
+
+        digitalWrite(stepPin, LOW);
+        delayMicroseconds(2000);
+    }
+}
+
+
+// =======================
+// รับคำสั่งจาก BLE
+// =======================
+class MyCharacteristicCallbacks : public BLECharacteristicCallbacks
+{
+    void onWrite(BLECharacteristic *pCharacteristic)
+    {
+        String value = pCharacteristic->getValue();
+
+        Serial.print("Received: ");
+        Serial.println(value);
+
+        // เมื่อได้รับค่า 1 ให้สถานะเป็นทำงาน, 0 ให้หยุด
+        if(value == "1")
+        {
+            isMotorRunning = true;
+            Serial.println("Motor Start");
+        }
+        else if (value == "0")
+        {
+            isMotorRunning = false;
+            Serial.println("Motor Stop");
+        }
+    }
+};
+
+// =======================
+// BLE Connect / Disconnect
+// =======================
+class MyServerCallbacks : public BLEServerCallbacks
+{
+
+    void onConnect(BLEServer *server)
+    {
+        deviceConnected = true;
+
+        Serial.println("BLE CONNECTED");
+    }
+
+
+
+    void onDisconnect(BLEServer *server)
+    {
+        deviceConnected = false;
+
+        Serial.println("BLE DISCONNECTED");
+
+
+        delay(500);
+
+        BLEDevice::startAdvertising();
+
+        Serial.println("Advertising Restart");
+    }
+
+};
+
+
+// =======================
+// Setup
+// =======================
+void setup()
+{
+    Serial.begin(115200);
+
+
+    // Stepper setup
+    pinMode(stepPin, OUTPUT);
+    pinMode(dirPin, OUTPUT);
+
+
+    digitalWrite(stepPin, LOW);
+    digitalWrite(dirPin, LOW);
+
+
+
+    // BLE setup
+    BLEDevice::init(DEVICE_NAME);
+
+
+
+    BLEServer *server =
+        BLEDevice::createServer();
+
+
+
+    server->setCallbacks(
+        new MyServerCallbacks()
+    );
+
+
+
+    BLEService *service =
+        server->createService(
+            SERVICE_UUID
+        );
+
+
+
+    BLECharacteristic *characteristic =
+        service->createCharacteristic(
+            CHARACTERISTIC_UUID,
+            BLECharacteristic::PROPERTY_WRITE
+        );
+
+
+
+    characteristic->setCallbacks(
+        new MyCharacteristicCallbacks()
+    );
+
+
+
+    service->start();
+
+
+
+    pAdvertising =
+        BLEDevice::getAdvertising();
+
+
+
+    pAdvertising->addServiceUUID(
+        SERVICE_UUID
+    );
+
+
+    pAdvertising->setScanResponse(true);
+
+
+
+    pAdvertising->setMinPreferred(0x06);
+
+    pAdvertising->setMinPreferred(0x12);
+
+
+
+    BLEDevice::startAdvertising();
+
+
+
+    Serial.println("BLE READY");
+}
+
+
+
+// =======================
+// Loop
+// =======================
+void loop()
+{
+    if (isMotorRunning) {
+        // หมุนมอเตอร์ทีละ 1 สเต็ปไปเรื่อยๆ จนกว่าจะได้รับคำสั่งปิด
+        digitalWrite(dirPin, HIGH);
+        digitalWrite(stepPin, HIGH);
+        delayMicroseconds(2000);
+        digitalWrite(stepPin, LOW);
+        delayMicroseconds(2000);
+    } else {
+        delay(100);
+    }
+}

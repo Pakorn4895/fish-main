@@ -24,7 +24,7 @@ ble_clients = {}
 class BleControlRequest(BaseModel):
     action: str
     address: str
-    name: str
+    name: str | None = None
 
 # โหลดค่าจากไฟล์ .env
 load_dotenv()
@@ -421,6 +421,46 @@ async def get_alerts():
         })
     return alerts
 
+@app.get("/api/analytics")
+async def get_analytics(date: str = None):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    if date:
+        # SQLite CURRENT_TIMESTAMP is in UTC, use localtime to display correctly
+        cursor.execute('''
+            SELECT strftime('%H:%M', datetime(timestamp, 'localtime')), temperature, ph_level, do_level, turbidity
+            FROM sensor_logs
+            WHERE date(datetime(timestamp, 'localtime')) = ?
+            ORDER BY timestamp ASC
+        ''', (date,))
+    else:
+        cursor.execute('''
+            SELECT strftime('%H:%M', datetime(timestamp, 'localtime')), temperature, ph_level, do_level, turbidity
+            FROM sensor_logs
+            ORDER BY timestamp DESC
+            LIMIT 100
+        ''')
+        
+    rows = cursor.fetchall()
+    conn.close()
+    
+    result = []
+    if not date:
+        rows.reverse()
+        
+    for row in rows:
+        result.append({
+            "time": row[0],
+            "temp": row[1],
+            "pH": row[2],
+            "DO": row[3],
+            "turbidity": row[4],
+            "ec": None # ec is not currently stored in the DB
+        })
+        
+    return result
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -501,6 +541,29 @@ if os.path.isdir(dist_dir):
         except Exception as e:
             return JSONResponse(status_code=500, content={"error": str(e)})
 
+    @app.get("/api/bluetooth/status")
+    async def status_bluetooth():
+        results = []
+        dead_clients = []
+        for address, client in ble_clients.items():
+            try:
+                connected = client.is_connected
+            except Exception:
+                connected = False
+            
+            results.append({
+                "address": address,
+                "connected": connected
+            })
+            if not connected:
+                dead_clients.append(address)
+                
+        # Clean up dead clients
+        for address in dead_clients:
+            del ble_clients[address]
+            
+        return {"devices": results}
+
     @app.post("/api/bluetooth/control")
     async def control_bluetooth(payload: BleControlRequest):
         address = payload.address
@@ -532,7 +595,10 @@ if os.path.isdir(dist_dir):
                 
         elif action == "disconnect":
             if address in ble_clients:
-                await ble_clients[address].disconnect()
+                try:
+                    await ble_clients[address].disconnect()
+                except Exception:
+                    pass
                 del ble_clients[address]
             return {"status": "disconnected"}
             

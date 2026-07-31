@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { 
   Fish,
   Plus,
@@ -6,7 +6,11 @@ import {
   Package,
   AlertCircle,
   RefreshCw,
-  Trash2
+  Trash2,
+  Bluetooth,
+  Edit2,
+  Check,
+  X
 } from "lucide-react";
 import { Card } from "./ui/card";
 import { Button } from "./ui/button";
@@ -34,10 +38,66 @@ import {
 } from "./ui/alert-dialog";
 import { toast } from "sonner";
 import { Switch } from "./ui/switch";
-import { Feeder } from "../App";
+import { Feeder, BluetoothDevice, ConnectedBluetoothDevice } from "../App";
 import { useSensorData } from "../hooks/useSensorData";
 
-export default function Feeding({ feeders, setFeeders }: { feeders: Feeder[], setFeeders: React.Dispatch<React.SetStateAction<Feeder[]>> }) {
+export default function Feeding({ 
+  feeders, 
+  setFeeders,
+  connectedBluetooth,
+  setConnectedBluetooth
+}: { 
+  feeders: Feeder[], 
+  setFeeders: React.Dispatch<React.SetStateAction<Feeder[]>>,
+  connectedBluetooth: ConnectedBluetoothDevice[],
+  setConnectedBluetooth: React.Dispatch<React.SetStateAction<ConnectedBluetoothDevice[]>>
+}) {
+  const [bluetoothDevices, setBluetoothDevices] = useState<BluetoothDevice[]>([]);
+  const [isScanning, setIsScanning] = useState(false);
+  const [editingDeviceAddress, setEditingDeviceAddress] = useState<string | null>(null);
+  const [editingDeviceName, setEditingDeviceName] = useState("");
+  const [feedDurations, setFeedDurations] = useState<Record<string, string>>({});
+  const [connectingAddress, setConnectingAddress] = useState<string | null>(null);
+
+  const connectedRef = useRef(connectedBluetooth);
+  connectedRef.current = connectedBluetooth;
+
+  useEffect(() => {
+    const checkBluetoothStatus = async () => {
+      const current = connectedRef.current;
+      if (current.length === 0) return;
+
+      try {
+        const res = await fetch("/api/bluetooth/status");
+        if (!res.ok) return;
+        const data = await res.json();
+        const statusList: { address: string; connected: boolean }[] = data.devices || [];
+
+        const stillOnline: ConnectedBluetoothDevice[] = [];
+        let dropped = false;
+        current.forEach(device => {
+          const found = statusList.find(s => s.address === device.address);
+          const isOnline = found ? found.connected : false;
+          if (isOnline) {
+            stillOnline.push(device);
+          } else {
+            toast.error(`อุปกรณ์ "${device.name || device.address}" หลุดการเชื่อมต่อ Bluetooth`);
+            dropped = true;
+          }
+        });
+
+        if (dropped) {
+          setConnectedBluetooth(stillOnline);
+        }
+      } catch (e) {
+        // silent error to avoid spam
+      }
+    };
+
+    const interval = setInterval(checkBluetoothStatus, 5000);
+    return () => clearInterval(interval);
+  }, [setConnectedBluetooth]);
+
   const { sendCommand } = useSensorData();
   const [feedInventory, setFeedInventory] = useState({
     remaining: 42.5,
@@ -109,6 +169,129 @@ export default function Feeding({ feeders, setFeeders }: { feeders: Feeder[], se
   const handleDeleteFeeder = (id: string) => {
     setFeeders(feeders.filter(f => f.id !== id));
     toast.success("ลบเครื่องให้อาหารสำเร็จ");
+  };
+
+  const scanBluetooth = async () => {
+    setIsScanning(true);
+    try {
+      const res = await fetch("/api/bluetooth/scan");
+      const data = await res.json();
+      setBluetoothDevices(Array.isArray(data) ? data : data.devices || []);
+    } catch (e) {
+      toast.error("ค้นหา Bluetooth ล้มเหลว");
+    } finally {
+      setIsScanning(false);
+    }
+  };
+
+  const connectBluetooth = async (device: BluetoothDevice) => {
+    setConnectingAddress(device.address);
+    try {
+      const res = await fetch("/api/bluetooth/control", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "connect", address: device.address, name: device.name })
+      });
+      if (res.ok) {
+        toast.success(`เชื่อมต่อ ${device.name || device.address} สำเร็จ`);
+        setConnectedBluetooth(prev => {
+          if (!prev.find(d => d.address === device.address)) {
+            return [...prev, { ...device, status: false }];
+          }
+          return prev;
+        });
+        setIsAddFeederOpen(false); // Close dialog on success
+      } else {
+        toast.error("เชื่อมต่อล้มเหลว");
+      }
+    } catch (e) {
+      toast.error("เชื่อมต่อล้มเหลว");
+    } finally {
+      setConnectingAddress(null);
+    }
+  };
+
+  const feedBluetoothDevice = async (address: string) => {
+    const device = connectedBluetooth.find(d => d.address === address);
+    if (!device) return;
+    
+    // Default to 3 seconds if not set
+    const durationStr = feedDurations[address] || "3";
+    const duration = parseInt(durationStr, 10);
+    if (isNaN(duration) || duration <= 0) {
+      toast.error("กรุณาระบุเวลาให้ถูกต้อง (วินาที)");
+      return;
+    }
+
+    // Set status to ON
+    setConnectedBluetooth(prev => prev.map(d => d.address === address ? { ...d, status: true } : d));
+
+    try {
+      const res = await fetch("/api/bluetooth/control", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "on", address, name: device.name })
+      });
+      if (res.ok) {
+        toast.success(`สั่งให้อาหาร ${device.name || device.address} เป็นเวลา ${duration} วินาที`);
+        
+        setTimeout(async () => {
+          try {
+            await fetch("/api/bluetooth/control", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ action: "off", address, name: device.name })
+            });
+          } catch (e) {
+            // silent error
+          }
+          // Turn off UI status
+          setConnectedBluetooth(prev => prev.map(d => 
+            d.address === address ? { ...d, status: false } : d
+          ));
+        }, duration * 1000);
+        
+      } else {
+        toast.error("ส่งคำสั่งล้มเหลว");
+        setConnectedBluetooth(prev => prev.map(d => d.address === address ? { ...d, status: false } : d));
+      }
+    } catch (e) {
+      toast.error("ส่งคำสั่งล้มเหลว");
+      setConnectedBluetooth(prev => prev.map(d => d.address === address ? { ...d, status: false } : d));
+    }
+  };
+
+  const disconnectBluetoothDevice = async (address: string) => {
+    try {
+      const res = await fetch("/api/bluetooth/control", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "disconnect", address })
+      });
+      if (res.ok) {
+        toast.success("ยกเลิกการเชื่อมต่อสำเร็จ");
+        setConnectedBluetooth(prev => prev.filter(d => d.address !== address));
+      } else {
+        toast.error("ยกเลิกการเชื่อมต่อล้มเหลว");
+      }
+    } catch (e) {
+      toast.error("ยกเลิกการเชื่อมต่อล้มเหลว");
+    }
+  };
+
+  const handleRenameBluetooth = (address: string) => {
+    if (!editingDeviceName.trim()) {
+      toast.error("กรุณาใส่ชื่ออุปกรณ์");
+      return;
+    }
+    setConnectedBluetooth(prev => prev.map(d => {
+      if (d.address === address) {
+        return { ...d, name: editingDeviceName };
+      }
+      return d;
+    }));
+    setEditingDeviceAddress(null);
+    toast.success("เปลี่ยนชื่ออุปกรณ์สำเร็จ");
   };
 
   const handleQuickFeed = (id: string) => {
@@ -241,54 +424,69 @@ export default function Feeding({ feeders, setFeeders }: { feeders: Feeder[], se
             <Fish className="w-5 h-5 text-blue-500" />
             เครื่องให้อาหาร
           </h3>
-          <Dialog open={isAddFeederOpen} onOpenChange={setIsAddFeederOpen}>
+          <Dialog open={isAddFeederOpen} onOpenChange={(open) => {
+            setIsAddFeederOpen(open);
+            if (open) scanBluetooth();
+          }}>
             <DialogTrigger asChild>
               <Button size="sm" className="bg-blue-600 hover:bg-blue-700">
                 <Plus className="w-4 h-4 mr-2" />
                 เพิ่มเครื่อง
               </Button>
             </DialogTrigger>
-            <DialogContent>
+            <DialogContent className="sm:max-w-md max-h-[90vh] overflow-y-auto">
               <DialogHeader>
                 <DialogTitle>เพิ่มเครื่องให้อาหาร</DialogTitle>
-                <DialogDescription>ตั้งค่าเครื่องให้อาหารตัวใหม่</DialogDescription>
+                <DialogDescription>เพิ่มเครื่องด้วยตนเอง หรือเชื่อมต่อผ่าน Bluetooth</DialogDescription>
               </DialogHeader>
-              <div className="space-y-4">
-                <div>
-                  <Label>ชื่อเครื่อง</Label>
-                  <Input 
-                    placeholder="เช่น เครื่องให้อาหาร C" 
-                    value={newFeeder.name} 
-                    onChange={e => setNewFeeder({ ...newFeeder, name: e.target.value })} 
-                  />
+              
+              <div className="space-y-6 mt-4">
+                {/* Bluetooth Section */}
+                <div className="space-y-4 border p-4 rounded-lg bg-blue-50/50">
+                  <div className="flex items-center justify-between">
+                    <h4 className="font-semibold text-sm text-blue-700 flex items-center gap-2">
+                      <Bluetooth className="w-4 h-4" />
+                      ค้นหา Bluetooth
+                    </h4>
+                    <Button variant="outline" size="sm" onClick={scanBluetooth} disabled={isScanning}>
+                      <RefreshCw className={`w-3 h-3 mr-2 ${isScanning ? 'animate-spin' : ''}`} />
+                      สแกนใหม่
+                    </Button>
+                  </div>
+                  
+                  <div className="flex flex-col gap-2 max-h-[200px] overflow-y-auto bg-white rounded border p-2">
+                    {isScanning ? (
+                      <div className="flex flex-col items-center justify-center py-6 text-slate-500">
+                        <RefreshCw className="w-6 h-6 animate-spin mb-2 text-blue-500" />
+                        <p className="text-sm">กำลังสแกน...</p>
+                      </div>
+                    ) : bluetoothDevices.length > 0 ? (
+                      bluetoothDevices.map((device, idx) => (
+                        <div key={idx} className="flex items-center justify-between p-2 border rounded hover:bg-slate-50 text-sm">
+                          <div className="overflow-hidden">
+                            <p className="font-medium text-slate-900 truncate">{device.name || "Unknown Device"}</p>
+                            <p className="text-xs text-slate-500">{device.address}</p>
+                          </div>
+                          <Button size="sm" onClick={() => connectBluetooth(device)} disabled={connectingAddress === device.address}>
+                            {connectingAddress === device.address ? (
+                              <><RefreshCw className="w-3 h-3 mr-1 animate-spin" /> กำลังเชื่อมต่อ...</>
+                            ) : "เชื่อมต่อ"}
+                          </Button>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="text-center py-6 text-slate-500 text-sm border border-dashed rounded bg-slate-50">
+                        ไม่พบอุปกรณ์
+                      </div>
+                    )}
+                  </div>
                 </div>
-                <div>
-                  <Label>ความจุ (kg)</Label>
-                  <Input 
-                    type="number" 
-                    step="0.5" 
-                    placeholder="10" 
-                    value={newFeeder.capacity} 
-                    onChange={e => setNewFeeder({ ...newFeeder, capacity: e.target.value })} 
-                  />
-                </div>
-                <div>
-                  <Label>ปริมาณอาหารปัจจุบัน (kg)</Label>
-                  <Input 
-                    type="number" 
-                    step="0.5" 
-                    placeholder="5" 
-                    value={newFeeder.remainingFeed} 
-                    onChange={e => setNewFeeder({ ...newFeeder, remainingFeed: e.target.value })} 
-                  />
-                </div>
-                <Button className="w-full" onClick={handleAddFeeder}>บันทึก</Button>
               </div>
             </DialogContent>
           </Dialog>
         </div>
 
-        {feeders.length === 0 ? (
+        {feeders.length === 0 && connectedBluetooth.length === 0 ? (
           <div className="text-center py-6 text-slate-500 border border-dashed border-slate-200 rounded-lg">
             ยังไม่มีเครื่องให้อาหารในระบบ กดปุ่ม "เพิ่มเครื่อง" เพื่อเพิ่มอุปกรณ์
           </div>
@@ -359,6 +557,99 @@ export default function Feeding({ feeders, setFeeders }: { feeders: Feeder[], se
                             <AlertDialogCancel>ยกเลิก</AlertDialogCancel>
                             <AlertDialogAction onClick={() => handleDeleteFeeder(feeder.id)} className="bg-red-600 hover:bg-red-700">
                               ลบ
+                            </AlertDialogAction>
+                          </AlertDialogFooter>
+                        </AlertDialogContent>
+                      </AlertDialog>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+
+            {/* Bluetooth Connected Feeders */}
+            {connectedBluetooth.map((device) => {
+              const isOn = device.status;
+              const isEditing = editingDeviceAddress === device.address;
+              
+              return (
+                <div key={device.address} className="p-4 rounded-xl border border-blue-200 bg-blue-50/30 shadow-sm flex flex-col justify-between">
+                  <div>
+                    <div className="flex items-center justify-between mb-3">
+                      <div className="flex items-center gap-2">
+                        <div className={`p-1.5 rounded-lg ${isOn ? "bg-blue-100 text-blue-600" : "bg-slate-100 text-slate-400"}`}>
+                          <Bluetooth className="w-4 h-4" />
+                        </div>
+                        {isEditing ? (
+                          <div className="flex items-center gap-1">
+                            <Input 
+                              size={12}
+                              className="h-7 text-sm py-1 px-2 w-32" 
+                              value={editingDeviceName} 
+                              onChange={e => setEditingDeviceName(e.target.value)} 
+                              autoFocus
+                            />
+                            <Button size="icon" variant="ghost" className="h-7 w-7 text-green-600" onClick={() => handleRenameBluetooth(device.address)}>
+                              <Check className="w-4 h-4" />
+                            </Button>
+                            <Button size="icon" variant="ghost" className="h-7 w-7 text-red-500" onClick={() => setEditingDeviceAddress(null)}>
+                              <X className="w-4 h-4" />
+                            </Button>
+                          </div>
+                        ) : (
+                          <div className="flex items-center gap-2 group cursor-pointer" onClick={() => {
+                            setEditingDeviceAddress(device.address);
+                            setEditingDeviceName(device.name || "");
+                          }}>
+                            <span className="font-semibold text-blue-900">{device.name || "Bluetooth Feeder"}</span>
+                            <Edit2 className="w-3 h-3 text-slate-300 group-hover:text-blue-500 transition-colors" />
+                          </div>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Input 
+                          type="number" 
+                          min="1" 
+                          placeholder="วิ" 
+                          className="w-16 h-8 text-sm"
+                          value={feedDurations[device.address] || "3"}
+                          onChange={(e) => setFeedDurations(prev => ({ ...prev, [device.address]: e.target.value }))}
+                          disabled={isOn}
+                        />
+                        <Button 
+                          size="sm" 
+                          className="h-8"
+                          onClick={() => feedBluetoothDevice(device.address)}
+                          disabled={isOn}
+                        >
+                          {isOn ? "กำลังทำงาน..." : "ให้อาหาร"}
+                        </Button>
+                      </div>
+                    </div>
+                    <div className="mb-4">
+                       <p className="text-xs text-slate-500 font-mono">{device.address}</p>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-end pt-2 border-t border-blue-100">
+                    <div className="flex gap-2">
+                      <AlertDialog>
+                        <AlertDialogTrigger asChild>
+                          <Button size="sm" variant="ghost" className="text-slate-400 hover:text-red-500 p-2">
+                            <Trash2 className="w-4 h-4" />
+                          </Button>
+                        </AlertDialogTrigger>
+                        <AlertDialogContent>
+                          <AlertDialogHeader>
+                            <AlertDialogTitle>ยกเลิกการเชื่อมต่อ?</AlertDialogTitle>
+                            <AlertDialogDescription>
+                              คุณแน่ใจว่าต้องการตัดการเชื่อมต่อ {device.name || device.address} หรือไม่?
+                            </AlertDialogDescription>
+                          </AlertDialogHeader>
+                          <AlertDialogFooter>
+                            <AlertDialogCancel>ยกเลิก</AlertDialogCancel>
+                            <AlertDialogAction onClick={() => disconnectBluetoothDevice(device.address)} className="bg-red-600 hover:bg-red-700">
+                              ตัดการเชื่อมต่อ
                             </AlertDialogAction>
                           </AlertDialogFooter>
                         </AlertDialogContent>

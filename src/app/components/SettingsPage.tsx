@@ -8,6 +8,7 @@ import { Switch } from "./ui/switch";
 import { toast } from "sonner";
 import { Pond, Reservoir } from "../App";
 
+
 interface SettingsPageProps {
   ponds: Pond[];
   setPonds: (ponds: Pond[]) => void;
@@ -15,7 +16,7 @@ interface SettingsPageProps {
   reservoir: Reservoir;
   setReservoir: (reservoir: Reservoir) => void;
   onLogout: () => void;
-  sendCommand: (device: string, state: boolean | number, payload?: any) => void;
+  sendCommand: (device: string, state: boolean, extra?: Record<string, unknown>) => void;
 }
 
 export default function SettingsPage({
@@ -68,7 +69,7 @@ export default function SettingsPage({
     }
   };
 
-  // ฟังก์ชันสลับการแจ้งเตือนเสียงไซเรนบนบอร์ด (ส่งข้อมูลผ่าน WebSocket)
+  // ฟังก์ชันสลับการแจ้งเตือนเสียงไซเรนบนบอร์ด
   const handleToggleBuzzer = (checked: boolean) => {
     setIsMuted(checked);
 
