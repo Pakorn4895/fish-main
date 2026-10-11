@@ -16,7 +16,8 @@ import {
   Info,
   FlaskConical,
   Leaf,
-  AlertTriangle
+  AlertTriangle,
+  Bluetooth
 } from "lucide-react";
 import { Card } from "./ui/card";
 import { Badge } from "./ui/badge";
@@ -442,7 +443,7 @@ export default function Overview({ pond, reservoir, feeders }: OverviewProps) {
             )}
           </div>
 
-          {feeders.length > 0 && (
+          {(feeders.length > 0) && (
             <div className="mt-4 pt-3 border-t border-slate-100 flex justify-between items-center text-xs text-slate-500">
               <span>รวม {feeders.length} เครื่อง</span>
               <span>ทำงานอยู่ {feeders.filter(f => f.status).length} เครื่อง</span>

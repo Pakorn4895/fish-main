@@ -22,6 +22,8 @@ interface SensorContextValue {
   isConnected: boolean;       // สถานะการเชื่อมต่อกับหลังบ้าน FastAPI
   isArduinoConnected: boolean; // 🌟 สถานะฮาร์ดแวร์บอร์ด Arduino Mega จริง
   isMockMode: boolean;
+  nodeStatus: Record<string, boolean>;
+  nodeData: Record<string, any>;
   sendCommand: (device: string, state: boolean, extra?: Record<string, unknown>) => void;
 }
 
@@ -37,6 +39,8 @@ const SensorContext = createContext<SensorContextValue>({
   isConnected: false,
   isArduinoConnected: false, // 🌟 ค่าเริ่มต้น
   isMockMode: true,
+  nodeStatus: {},
+  nodeData: {},
   sendCommand: () => { },
 });
 
@@ -52,6 +56,8 @@ export function SensorProvider({ children }: { children: React.ReactNode }) {
   const [isConnected, setIsConnected] = useState(false);
   const [isArduinoConnected, setIsArduinoConnected] = useState(false); // 🌟 State เก็บสถานะบอร์ดจริง
   const [isMockMode, setIsMockMode] = useState(true);
+  const [nodeStatus, setNodeStatus] = useState<Record<string, boolean>>({});
+  const [nodeData, setNodeData] = useState<Record<string, any>>({});
   const wsRef = useRef<WebSocket | null>(null);
 
   useEffect(() => {
@@ -70,8 +76,23 @@ export function SensorProvider({ children }: { children: React.ReactNode }) {
         try {
           const payload = JSON.parse(event.data);
 
-          // 1. ตรวจสอบสถานะ Server และสถานะบอร์ด Arduino จริงจาก FastAPI (เชื่อมั่นตรงนี้ตัวเดียว!)
-          if (payload.type === 'serverStatus') {
+          // 1. ตรวจสอบสถานะ Node (Heartbeat) และเก็บค่าเซนเซอร์ย่อย (เช่น loadcell weight)
+          if (payload.type === 'nodeStatus') {
+            setNodeStatus(prev => ({
+              ...prev,
+              [payload.nodeId]: payload.status === 'online'
+            }));
+            
+            const { type, nodeId, status, ...extraData } = payload;
+            if (Object.keys(extraData).length > 0) {
+              setNodeData(prev => ({
+                ...prev,
+                [nodeId]: { ...prev[nodeId], ...extraData }
+              }));
+            }
+          }
+          // 2. ตรวจสอบสถานะ Server และสถานะบอร์ด Arduino จริงจาก FastAPI
+          else if (payload.type === 'serverStatus') {
             setIsMockMode(payload.mockMode);
             setIsArduinoConnected(payload.arduinoConnected ?? false);
           }
@@ -150,7 +171,7 @@ export function SensorProvider({ children }: { children: React.ReactNode }) {
   };
 
   return (
-    <SensorContext.Provider value={{ data, isConnected, isArduinoConnected, isMockMode, sendCommand }}>
+    <SensorContext.Provider value={{ data, isConnected, isArduinoConnected, isMockMode, nodeStatus, nodeData, sendCommand }}>
       {children}
     </SensorContext.Provider>
   );

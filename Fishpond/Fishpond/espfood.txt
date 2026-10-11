@@ -1,208 +1,210 @@
-#include <BLEDevice.h>
-#include <BLEUtils.h>
-#include <BLEServer.h>
+#include <esp_now.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
 
 // =======================
-// Stepper Motor
+// ตั้งค่ารหัสประจำตัวบ่อ (Node ID) และ Gateway
+// =======================
+// *** สำคัญ: ถ้าเอาโค้ดนี้ไปลงบอร์ดบ่อที่ 2 ให้เปลี่ยนตัวเลขนี้เป็น 2 ***
+const int NODE_ID = 1;  
+
+// *** กรุณาเปลี่ยน MAC Address ด้านล่างนี้ ให้ตรงกับบอร์ด Gateway ของคุณ ***
+// ตัวอย่างรูปแบบ: {0x11, 0x22, 0x33, 0x44, 0x55, 0x66}
+uint8_t gatewayAddress[] = {0x9C, 0x63, 0xD7, 0x2F, 0x2B, 0x14};
+
+// =======================
+// Stepper Motor (เครื่องให้อาหาร)
 // =======================
 const int dirPin = 23;
 const int stepPin = 22;
-
 const int stepsPerRev = 200;
 
+bool isMotorRunning = false;
 
 // =======================
-// BLE
+// Relay (เครื่องให้สาร/Peristaltic Pump)
 // =======================
-#define DEVICE_NAME "Biofloc_Motor_01"
-
-#define SERVICE_UUID        "4fa87100-873e-10c5-a854-075059a4c500"
-#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
-
-
-BLEAdvertising *pAdvertising;
-
-bool deviceConnected = false;
-bool isMotorRunning = false; // ตัวแปรเก็บสถานะการหมุนมอเตอร์
-
+const int relayPin = 21; // สามารถเปลี่ยนขา GPIO ได้ตามต้องการ
+unsigned long relayOffTime = 0;
+bool isRelayOn = false;
 
 // =======================
-// ฟังก์ชันหมุนมอเตอร์
+// โครงสร้างข้อมูล (ต้องตรงกับ Gateway 100%)
 // =======================
-void stepMotor()
-{
-    digitalWrite(dirPin, HIGH);   // ทิศทางการหมุน
+typedef struct struct_message {
+  int node_id;
+  int command;
+  int amount;   // จำนวนรอบ หรือระยะเวลา
+} struct_message;
 
-    for(int i = 0; i < stepsPerRev; i++)
-    {
-        digitalWrite(stepPin, HIGH);
-        delayMicroseconds(2000);
+struct_message myData;
 
-        digitalWrite(stepPin, LOW);
-        delayMicroseconds(2000);
-    }
+// =======================
+// โครงสร้าง Heartbeat
+// =======================
+typedef struct struct_heartbeat {
+  int node_id;
+  bool is_online;
+} struct_heartbeat;
+
+struct_heartbeat heartbeatMsg;
+unsigned long lastHeartbeatTime = 0;
+const unsigned long heartbeatInterval = 10000; // ส่ง Heartbeat ทุก 10 วินาที
+
+esp_now_peer_info_t peerInfo;
+
+// =======================
+// ฟังก์ชันเมื่อส่งข้อมูล
+// =======================
+void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
+  // ไม่ต้องแสดงผลบน Serial บ่อยๆ เพื่อไม่ให้รกจอ
 }
 
-
 // =======================
-// รับคำสั่งจาก BLE
+// ฟังก์ชันรับข้อมูล ESP-NOW
 // =======================
-class MyCharacteristicCallbacks : public BLECharacteristicCallbacks
-{
-    void onWrite(BLECharacteristic *pCharacteristic)
-    {
-        String value = pCharacteristic->getValue();
+void OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_t *incomingData, int len) {
+  // ดึง MAC Address ของคนที่ส่งมา
+  const uint8_t *mac = esp_now_info->src_addr;
 
-        Serial.print("Received: ");
-        Serial.println(value);
-
-        // เมื่อได้รับค่า 1 ให้สถานะเป็นทำงาน, 0 ให้หยุด
-        if(value == "1")
-        {
-            isMotorRunning = true;
-            Serial.println("Motor Start");
-        }
-        else if (value == "0")
-        {
-            isMotorRunning = false;
-            Serial.println("Motor Stop");
-        }
+  // 1. ตรวจสอบว่า MAC Address ที่ส่งมา ตรงกับ Gateway ของเราหรือไม่
+  bool isFromGateway = true;
+  for (int i = 0; i < 6; i++) {
+    if (mac[i] != gatewayAddress[i]) {
+      isFromGateway = false;
+      break;
     }
-};
+  }
+
+  // ถ้าไม่ได้มาจาก Gateway ให้ return ทิ้งไปเลย
+  if (!isFromGateway) {
+    Serial.printf("❌ เพิกเฉยข้อมูลจาก MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    return; 
+  }
+
+  memcpy(&myData, incomingData, sizeof(myData));
+  
+  // ตอบกลับทันทีหากเป็นการร้องขอ Scan (Broadcast)
+  if (myData.node_id == 255 && myData.command == 99) {
+    Serial.println("🔍 ได้รับคำสั่ง Scan จาก Gateway -> ตอบกลับทันที");
+    sendHeartbeat();
+    return;
+  }
+  
+  // เช็คว่าเป็นคำสั่งของบ่อตัวเองหรือไม่ (ถ้าไม่ใช่ จะเมินคำสั่งทิ้งไป)
+  if (myData.node_id == NODE_ID) {
+    Serial.print("✅ ได้รับคำสั่งสำหรับบ่อที่ ");
+    Serial.print(NODE_ID);
+    Serial.print(" -> สั่งการ (Command): ");
+    Serial.print(myData.command);
+    Serial.print(" | จำนวน (Amount): ");
+    Serial.println(myData.amount);
+    
+    // Command 0/1: เครื่องให้อาหาร (Stepper Motor) - 1=เปิด, 0=ปิด
+    if (myData.command == 1) {
+      isMotorRunning = true;
+    } else if (myData.command == 0) {
+      isMotorRunning = false;
+    }
+    // Command 2: เครื่องให้สาร (Relay) - เปิดตามระยะเวลา (ms) ที่กำหนดใน amount
+    else if (myData.command == 2 && myData.amount > 0) {
+      digitalWrite(relayPin, HIGH); // สั่งเปิด Relay (หากใช้ Relay แบบ Active LOW ให้เปลี่ยนเป็น LOW)
+      isRelayOn = true;
+      relayOffTime = millis() + myData.amount;
+      Serial.print("🟢 เปิดปั๊มให้สารเป็นเวลา (ms): ");
+      Serial.println(myData.amount);
+    }
+  }
+}
 
 // =======================
-// BLE Connect / Disconnect
+// ฟังก์ชันส่งสถานะ (Heartbeat)
 // =======================
-class MyServerCallbacks : public BLEServerCallbacks
-{
-
-    void onConnect(BLEServer *server)
-    {
-        deviceConnected = true;
-
-        Serial.println("BLE CONNECTED");
-    }
-
-
-
-    void onDisconnect(BLEServer *server)
-    {
-        deviceConnected = false;
-
-        Serial.println("BLE DISCONNECTED");
-
-
-        delay(500);
-
-        BLEDevice::startAdvertising();
-
-        Serial.println("Advertising Restart");
-    }
-
-};
-
+void sendHeartbeat() {
+  lastHeartbeatTime = millis();
+  heartbeatMsg.node_id = NODE_ID;
+  heartbeatMsg.is_online = true;
+  esp_now_send(gatewayAddress, (uint8_t *) &heartbeatMsg, sizeof(heartbeatMsg));
+}
 
 // =======================
 // Setup
 // =======================
-void setup()
-{
-    Serial.begin(115200);
+void setup() {
+  Serial.begin(115200);
 
+  // Stepper setup
+  pinMode(stepPin, OUTPUT);
+  pinMode(dirPin, OUTPUT);
+  digitalWrite(stepPin, LOW);
+  digitalWrite(dirPin, LOW);
 
-    // Stepper setup
-    pinMode(stepPin, OUTPUT);
-    pinMode(dirPin, OUTPUT);
+  // Relay setup (เครื่องให้สาร)
+  pinMode(relayPin, OUTPUT);
+  digitalWrite(relayPin, LOW); // ปิด Relay ไว้เริ่มต้น (หากใช้ Active LOW ให้เปลี่ยนเป็น HIGH)
 
+  // ตั้งค่า WiFi เป็นโหมด Station (เงื่อนไขบังคับของ ESP-NOW)
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
 
-    digitalWrite(stepPin, LOW);
-    digitalWrite(dirPin, LOW);
+  // ล็อก WiFi Channel ให้อยู่ช่อง 6 (ตรงกับ Gateway)
+  esp_wifi_set_channel(6, WIFI_SECOND_CHAN_NONE);
 
+  Serial.print("MAC Address ของบอร์ดนี้คือ: ");
+  Serial.println(WiFi.macAddress());
 
+  // เริ่มต้น ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("❌ Error initializing ESP-NOW");
+    return;
+  }
 
-    // BLE setup
-    BLEDevice::init(DEVICE_NAME);
+  // ลงทะเบียนฟังก์ชันรอรับข้อมูล
+  esp_now_register_recv_cb(OnDataRecv);
+  
+  // ลงทะเบียนฟังก์ชันเมื่อส่งข้อมูล
+  esp_now_register_send_cb(OnDataSent);
 
-
-
-    BLEServer *server =
-        BLEDevice::createServer();
-
-
-
-    server->setCallbacks(
-        new MyServerCallbacks()
-    );
-
-
-
-    BLEService *service =
-        server->createService(
-            SERVICE_UUID
-        );
-
-
-
-    BLECharacteristic *characteristic =
-        service->createCharacteristic(
-            CHARACTERISTIC_UUID,
-            BLECharacteristic::PROPERTY_WRITE
-        );
-
-
-
-    characteristic->setCallbacks(
-        new MyCharacteristicCallbacks()
-    );
-
-
-
-    service->start();
-
-
-
-    pAdvertising =
-        BLEDevice::getAdvertising();
-
-
-
-    pAdvertising->addServiceUUID(
-        SERVICE_UUID
-    );
-
-
-    pAdvertising->setScanResponse(true);
-
-
-
-    pAdvertising->setMinPreferred(0x06);
-
-    pAdvertising->setMinPreferred(0x12);
-
-
-
-    BLEDevice::startAdvertising();
-
-
-
-    Serial.println("BLE READY");
+  // เพิ่ม Gateway เป็น Peer
+  memcpy(peerInfo.peer_addr, gatewayAddress, 6);
+  peerInfo.channel = 6;
+  peerInfo.encrypt = false;
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("❌ Failed to add peer");
+  }
+  
+  Serial.println("🟢 ESP-NOW Feeder Node Ready!");
+  Serial.print("📍 ฉันคือบ่อที่: ");
+  Serial.println(NODE_ID);
 }
-
-
 
 // =======================
 // Loop
 // =======================
-void loop()
-{
-    if (isMotorRunning) {
-        // หมุนมอเตอร์ทีละ 1 สเต็ปไปเรื่อยๆ จนกว่าจะได้รับคำสั่งปิด
-        digitalWrite(dirPin, HIGH);
-        digitalWrite(stepPin, HIGH);
-        delayMicroseconds(2000);
-        digitalWrite(stepPin, LOW);
-        delayMicroseconds(2000);
-    } else {
-        delay(100);
-    }
+void loop() {
+  unsigned long currentMillis = millis();
+  
+  // ส่ง Heartbeat กลับไปหา Gateway ทุก 10 วินาที
+  if (currentMillis - lastHeartbeatTime >= heartbeatInterval) {
+    sendHeartbeat();
+  }
+
+  // จัดการปิดปั๊มสารเมื่อครบเวลาที่กำหนด
+  if (isRelayOn && currentMillis >= relayOffTime) {
+    digitalWrite(relayPin, LOW); // ปิด Relay (หากใช้ Active LOW ให้เปลี่ยนเป็น HIGH)
+    isRelayOn = false;
+    Serial.println("🔴 ปิดปั๊มให้สารแล้ว (ครบกำหนดเวลา)");
+  }
+
+  if (isMotorRunning) {
+    digitalWrite(dirPin, LOW);
+    digitalWrite(stepPin, HIGH);
+    delayMicroseconds(2000);
+    digitalWrite(stepPin, LOW);
+    delayMicroseconds(2000);
+  } else {
+    // ถ้ามอเตอร์ไม่ได้หมุน ให้หน่วงเวลาเล็กน้อยเพื่อลดความร้อน CPU
+    delay(10); 
+  }
 }

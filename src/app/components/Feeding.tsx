@@ -10,7 +10,8 @@ import {
   Bluetooth,
   Edit2,
   Check,
-  X
+  X,
+  Server
 } from "lucide-react";
 import { Card } from "./ui/card";
 import { Button } from "./ui/button";
@@ -38,72 +39,19 @@ import {
 } from "./ui/alert-dialog";
 import { toast } from "sonner";
 import { Switch } from "./ui/switch";
-import { Feeder, BluetoothDevice, ConnectedBluetoothDevice } from "../App";
+import { Feeder } from "../App";
 import { useSensorData } from "../hooks/useSensorData";
 
 export default function Feeding({ 
   feeders, 
   setFeeders,
-  connectedBluetooth,
-  setConnectedBluetooth
 }: { 
   feeders: Feeder[], 
   setFeeders: React.Dispatch<React.SetStateAction<Feeder[]>>,
-  connectedBluetooth: ConnectedBluetoothDevice[],
-  setConnectedBluetooth: React.Dispatch<React.SetStateAction<ConnectedBluetoothDevice[]>>
 }) {
-  const [bluetoothDevices, setBluetoothDevices] = useState<BluetoothDevice[]>([]);
-  const [isScanning, setIsScanning] = useState(false);
-  const [editingDeviceAddress, setEditingDeviceAddress] = useState<string | null>(null);
-  const [editingDeviceName, setEditingDeviceName] = useState("");
+  const { sendCommand, nodeStatus, nodeData } = useSensorData();
   const [feedDurations, setFeedDurations] = useState<Record<string, string>>({});
-  const [connectingAddress, setConnectingAddress] = useState<string | null>(null);
 
-  const connectedRef = useRef(connectedBluetooth);
-  connectedRef.current = connectedBluetooth;
-
-  useEffect(() => {
-    const checkBluetoothStatus = async () => {
-      const current = connectedRef.current;
-      if (current.length === 0) return;
-
-      try {
-        const res = await fetch("/api/bluetooth/status");
-        if (!res.ok) return;
-        const data = await res.json();
-        const statusList: { address: string; connected: boolean }[] = data.devices || [];
-
-        const stillOnline: ConnectedBluetoothDevice[] = [];
-        let dropped = false;
-        current.forEach(device => {
-          const found = statusList.find(s => s.address === device.address);
-          const isOnline = found ? found.connected : false;
-          if (isOnline) {
-            stillOnline.push(device);
-          } else {
-            toast.error(`อุปกรณ์ "${device.name || device.address}" หลุดการเชื่อมต่อ Bluetooth`);
-            dropped = true;
-          }
-        });
-
-        if (dropped) {
-          setConnectedBluetooth(stillOnline);
-        }
-      } catch (e) {
-        // silent error to avoid spam
-      }
-    };
-
-    const interval = setInterval(checkBluetoothStatus, 5000);
-    return () => clearInterval(interval);
-  }, [setConnectedBluetooth]);
-
-  const { sendCommand } = useSensorData();
-  const [feedInventory, setFeedInventory] = useState({
-    remaining: 42.5,
-    total: 50,
-  });
-  const [refillAmount, setRefillAmount] = useState("");
 
   const [feedingSchedule, setFeedingSchedule] = useState([
     { id: 1, time: "06:00", amount: 0.8, status: "completed" },
@@ -114,8 +62,26 @@ export default function Feeding({
   const [newSchedule, setNewSchedule] = useState({ time: "", amount: "" });
   const [isAddScheduleOpen, setIsAddScheduleOpen] = useState(false);
 
-  const [newFeeder, setNewFeeder] = useState({ name: "", capacity: "", remainingFeed: "" });
+  const [newFeeder, setNewFeeder] = useState({ 
+    id: "", 
+    name: "", 
+    type: "feeder", 
+    capacity: "", 
+    capacityMolasses: "",
+    capacityLime: ""
+  });
   const [isAddFeederOpen, setIsAddFeederOpen] = useState(false);
+  const [isScanning, setIsScanning] = useState(false);
+
+  const handleScanNodes = () => {
+    setIsScanning(true);
+    sendCommand('scan', true);
+    
+    // จำลองระยะเวลาสแกน แล้วหยุดโหลด
+    setTimeout(() => {
+      setIsScanning(false);
+    }, 3000);
+  };
 
   const handleAddSchedule = () => {
     if (!newSchedule.time || !newSchedule.amount) return;
@@ -143,166 +109,64 @@ export default function Feeding({
   };
 
   const handleAddFeeder = () => {
-    if (!newFeeder.name || !newFeeder.capacity || !newFeeder.remainingFeed) {
+    if (!newFeeder.id || !newFeeder.name) {
       toast.error("กรุณากรอกข้อมูลให้ครบถ้วน");
       return;
     }
-    const cap = parseFloat(newFeeder.capacity);
-    const rem = parseFloat(newFeeder.remainingFeed);
-    if (isNaN(cap) || cap <= 0 || isNaN(rem) || rem < 0 || rem > cap) {
-      toast.error("กรุณากรอกปริมาณที่ถูกต้อง (ปริมาณคงเหลือต้องไม่เกินความจุ)");
-      return;
+    if (newFeeder.type === "feeder") {
+      const cap = parseFloat(newFeeder.capacity);
+      if (isNaN(cap) || cap <= 0) {
+        toast.error("กรุณากรอกความจุสูงสุดที่ถูกต้อง");
+        return;
+      }
+      const newF: Feeder = {
+        id: newFeeder.id,
+        name: newFeeder.name,
+        type: "feeder",
+        status: false,
+        capacity: cap,
+      };
+      setFeeders([...feeders, newF]);
+    } else {
+      const capM = parseFloat(newFeeder.capacityMolasses);
+      const capL = parseFloat(newFeeder.capacityLime);
+      if (isNaN(capM) || capM <= 0 || isNaN(capL) || capL <= 0) {
+        toast.error("กรุณากรอกความจุสูงสุดที่ถูกต้อง");
+        return;
+      }
+      const newF: Feeder = {
+        id: newFeeder.id,
+        name: newFeeder.name,
+        type: "dispenser",
+        status: false,
+        capacityMolasses: capM,
+        capacityLime: capL,
+      };
+      setFeeders([...feeders, newF]);
     }
-    const newF: Feeder = {
-      id: Date.now().toString(),
-      name: newFeeder.name,
-      status: false,
-      capacity: cap,
-      remainingFeed: rem,
-    };
-    setFeeders([...feeders, newF]);
-    setNewFeeder({ name: "", capacity: "", remainingFeed: "" });
+    setNewFeeder({ 
+      id: "", name: "", type: "feeder", 
+      capacity: "",
+      capacityMolasses: "",
+      capacityLime: ""
+    });
     setIsAddFeederOpen(false);
-    toast.success("เพิ่มเครื่องให้อาหารสำเร็จ");
+    toast.success("เพิ่มอุปกรณ์สำเร็จ");
   };
 
   const handleDeleteFeeder = (id: string) => {
     setFeeders(feeders.filter(f => f.id !== id));
     toast.success("ลบเครื่องให้อาหารสำเร็จ");
   };
-
-  const scanBluetooth = async () => {
-    setIsScanning(true);
-    try {
-      const res = await fetch("/api/bluetooth/scan");
-      const data = await res.json();
-      setBluetoothDevices(Array.isArray(data) ? data : data.devices || []);
-    } catch (e) {
-      toast.error("ค้นหา Bluetooth ล้มเหลว");
-    } finally {
-      setIsScanning(false);
-    }
-  };
-
-  const connectBluetooth = async (device: BluetoothDevice) => {
-    setConnectingAddress(device.address);
-    try {
-      const res = await fetch("/api/bluetooth/control", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "connect", address: device.address, name: device.name })
-      });
-      if (res.ok) {
-        toast.success(`เชื่อมต่อ ${device.name || device.address} สำเร็จ`);
-        setConnectedBluetooth(prev => {
-          if (!prev.find(d => d.address === device.address)) {
-            return [...prev, { ...device, status: false }];
-          }
-          return prev;
-        });
-        setIsAddFeederOpen(false); // Close dialog on success
-      } else {
-        toast.error("เชื่อมต่อล้มเหลว");
-      }
-    } catch (e) {
-      toast.error("เชื่อมต่อล้มเหลว");
-    } finally {
-      setConnectingAddress(null);
-    }
-  };
-
-  const feedBluetoothDevice = async (address: string) => {
-    const device = connectedBluetooth.find(d => d.address === address);
-    if (!device) return;
-    
-    // Default to 3 seconds if not set
-    const durationStr = feedDurations[address] || "3";
-    const duration = parseInt(durationStr, 10);
-    if (isNaN(duration) || duration <= 0) {
-      toast.error("กรุณาระบุเวลาให้ถูกต้อง (วินาที)");
-      return;
-    }
-
-    // Set status to ON
-    setConnectedBluetooth(prev => prev.map(d => d.address === address ? { ...d, status: true } : d));
-
-    try {
-      const res = await fetch("/api/bluetooth/control", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "on", address, name: device.name })
-      });
-      if (res.ok) {
-        toast.success(`สั่งให้อาหาร ${device.name || device.address} เป็นเวลา ${duration} วินาที`);
-        
-        setTimeout(async () => {
-          try {
-            await fetch("/api/bluetooth/control", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ action: "off", address, name: device.name })
-            });
-          } catch (e) {
-            // silent error
-          }
-          // Turn off UI status
-          setConnectedBluetooth(prev => prev.map(d => 
-            d.address === address ? { ...d, status: false } : d
-          ));
-        }, duration * 1000);
-        
-      } else {
-        toast.error("ส่งคำสั่งล้มเหลว");
-        setConnectedBluetooth(prev => prev.map(d => d.address === address ? { ...d, status: false } : d));
-      }
-    } catch (e) {
-      toast.error("ส่งคำสั่งล้มเหลว");
-      setConnectedBluetooth(prev => prev.map(d => d.address === address ? { ...d, status: false } : d));
-    }
-  };
-
-  const disconnectBluetoothDevice = async (address: string) => {
-    try {
-      const res = await fetch("/api/bluetooth/control", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "disconnect", address })
-      });
-      if (res.ok) {
-        toast.success("ยกเลิกการเชื่อมต่อสำเร็จ");
-        setConnectedBluetooth(prev => prev.filter(d => d.address !== address));
-      } else {
-        toast.error("ยกเลิกการเชื่อมต่อล้มเหลว");
-      }
-    } catch (e) {
-      toast.error("ยกเลิกการเชื่อมต่อล้มเหลว");
-    }
-  };
-
-  const handleRenameBluetooth = (address: string) => {
-    if (!editingDeviceName.trim()) {
-      toast.error("กรุณาใส่ชื่ออุปกรณ์");
-      return;
-    }
-    setConnectedBluetooth(prev => prev.map(d => {
-      if (d.address === address) {
-        return { ...d, name: editingDeviceName };
-      }
-      return d;
-    }));
-    setEditingDeviceAddress(null);
-    toast.success("เปลี่ยนชื่ออุปกรณ์สำเร็จ");
-  };
-
   const handleQuickFeed = (id: string) => {
     setFeeders(prevFeeders => prevFeeders.map(f => {
       if (f.id === id) {
-        if (f.remainingFeed <= 0) {
+        if ((f.remainingFeed || 0) <= 0) {
           toast.error(`เครื่อง ${f.name} อาหารหมดแล้ว!`);
           return f;
         }
         const dose = 0.5; // default dose in kg
-        const updatedFeed = Math.max(0, parseFloat((f.remainingFeed - dose).toFixed(2)));
+        const updatedFeed = Math.max(0, parseFloat(((f.remainingFeed || 0) - dose).toFixed(2)));
         
         // Send command to toggle state
         sendCommand(`feeder_${f.id}`, true);
@@ -323,6 +187,36 @@ export default function Feeding({
     }));
   };
 
+  const handleQuickDispense = (id: string, chemType: 'molasses' | 'lime') => {
+    setFeeders(prevFeeders => prevFeeders.map(f => {
+      if (f.id === id && f.type === 'dispenser') {
+        const dose = 50; // default dose in grams
+        if (chemType === 'molasses') {
+           if ((f.remainingMolasses || 0) <= 0) {
+             toast.error(`เครื่อง ${f.name} กากน้ำตาลหมดแล้ว!`);
+             return f;
+           }
+           const updatedFeed = Math.max(0, (f.remainingMolasses || 0) - dose);
+           sendCommand(`dispense_molasses_${f.id}`, true);
+           toast.success(`สั่งจ่ายกากน้ำตาลด่วน สำเร็จ (จ่ายออก ${dose} กรัม)`);
+           setTimeout(() => sendCommand(`dispense_molasses_${f.id}`, false), 3000);
+           return { ...f, remainingMolasses: updatedFeed, lastFed: new Date().toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' }) + " น." };
+        } else {
+           if ((f.remainingLime || 0) <= 0) {
+             toast.error(`เครื่อง ${f.name} ปูนขาวหมดแล้ว!`);
+             return f;
+           }
+           const updatedFeed = Math.max(0, (f.remainingLime || 0) - dose);
+           sendCommand(`dispense_lime_${f.id}`, true);
+           toast.success(`สั่งจ่ายปูนขาวด่วน สำเร็จ (จ่ายออก ${dose} กรัม)`);
+           setTimeout(() => sendCommand(`dispense_lime_${f.id}`, false), 3000);
+           return { ...f, remainingLime: updatedFeed, lastFed: new Date().toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' }) + " น." };
+        }
+      }
+      return f;
+    }));
+  };
+
   const toggleFeeder = (id: string, currentState: boolean) => {
     const newState = !currentState;
     setFeeders(prevFeeders => prevFeeders.map(f => {
@@ -335,22 +229,6 @@ export default function Feeding({
     }));
   };
 
-  const feedPercentage = (feedInventory.remaining / feedInventory.total) * 100;
-
-  const handleRefill = () => {
-    const amount = parseFloat(refillAmount);
-    if (isNaN(amount) || amount <= 0) {
-      toast.error("กรุณาใส่จำนวนที่ถูกต้อง");
-      return;
-    }
-    if (amount > feedInventory.remaining) {
-      toast.error(`ให้ได้สูงสุด ${feedInventory.remaining.toFixed(1)} kg`);
-      return;
-    }
-    setFeedInventory({ ...feedInventory, remaining: feedInventory.remaining - amount });
-    setRefillAmount("");
-    toast.success(`ให้อาหารสำเร็จ ${amount} kg`);
-  };
 
   return (
     <div className="p-4 md:p-6">
@@ -362,145 +240,159 @@ export default function Feeding({
         </div>
       </div>
 
-      {/* Feed Inventory Card */}
-      <Card className="p-6 mb-6">
-        <h3 className="font-semibold text-slate-900 mb-4 flex items-center gap-2">
-          <Package className="w-5 h-5 text-orange-500" />
-          ปริมาณอาหารที่มีอยู่
-        </h3>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-          <div>
-            <div className="flex items-end gap-2 mb-3">
-              <span className="text-4xl font-bold text-slate-900">{feedInventory.remaining}</span>
-              <span className="text-slate-500 mb-1">/ {feedInventory.total} kg</span>
-              <span className={`ml-auto text-sm font-medium ${
-                feedPercentage < 20 ? "text-red-600" : feedPercentage < 50 ? "text-amber-600" : "text-green-600"
-              }`}>{feedPercentage.toFixed(0)}%</span>
-            </div>
-            <div className="h-4 bg-slate-100 rounded-full overflow-hidden">
-              <div
-                className={`h-full rounded-full transition-all ${
-                  feedPercentage < 20 ? "bg-red-500" : feedPercentage < 50 ? "bg-amber-500" : "bg-green-500"
-                }`}
-                style={{ width: `${feedPercentage}%` }}
-              />
-            </div>
-            {feedPercentage < 20 && (
-              <div className="flex items-center gap-2 mt-3 p-3 bg-red-50 border border-red-200 rounded-lg">
-                <AlertCircle className="w-4 h-4 text-red-600 flex-shrink-0" />
-                <p className="text-sm text-red-700">อาหารเหลือน้อย! กรุณาให้อาหาร</p>
-              </div>
-            )}
-          </div>
-          <div className="space-y-3">
-            <div>
-              <Label className="text-sm">ให้อาหาร (kg)</Label>
-              <div className="flex gap-2 mt-1">
-                <Input
-                  type="number"
-                  step="0.1"
-                  min="0"
-                  placeholder="0.0"
-                  value={refillAmount}
-                  onChange={(e) => setRefillAmount(e.target.value)}
-                />
-                <Button onClick={handleRefill} className="bg-green-600 hover:bg-green-700 whitespace-nowrap">
-                  <RefreshCw className="w-4 h-4 mr-1" />
-                  ให้
-                </Button>
-              </div>
-              <p className="text-xs text-slate-500 mt-1">
-                ให้ได้อีก: {feedInventory.remaining.toFixed(1)} kg
-              </p>
-            </div>
-          </div>
-        </div>
-      </Card>
-
       {/* Feeder Machines Section */}
       <Card className="p-6 mb-6">
         <div className="flex items-center justify-between mb-4">
           <h3 className="font-semibold text-slate-900 flex items-center gap-2">
             <Fish className="w-5 h-5 text-blue-500" />
-            เครื่องให้อาหาร
+            เครื่องให้อาหารและเครื่องใส่สาร
           </h3>
           <Dialog open={isAddFeederOpen} onOpenChange={(open) => {
             setIsAddFeederOpen(open);
-            if (open) scanBluetooth();
+            if (open) handleScanNodes();
           }}>
             <DialogTrigger asChild>
               <Button size="sm" className="bg-blue-600 hover:bg-blue-700">
-                <Plus className="w-4 h-4 mr-2" />
-                เพิ่มเครื่อง
+                <Bluetooth className="w-4 h-4 mr-2" />
+                สแกนหาเครื่อง
               </Button>
             </DialogTrigger>
             <DialogContent className="sm:max-w-md max-h-[90vh] overflow-y-auto">
               <DialogHeader>
-                <DialogTitle>เพิ่มเครื่องให้อาหาร</DialogTitle>
-                <DialogDescription>เพิ่มเครื่องด้วยตนเอง หรือเชื่อมต่อผ่าน Bluetooth</DialogDescription>
+                <DialogTitle>สแกนหาเครื่องให้อาหาร (ESP-NOW)</DialogTitle>
+                <DialogDescription>
+                  {isScanning 
+                    ? "กำลังส่งสัญญาณค้นหาเครื่องให้อาหารในรัศมี..." 
+                    : "ผลการค้นหาเครื่องให้อาหารที่ออนไลน์อยู่"}
+                </DialogDescription>
               </DialogHeader>
               
-              <div className="space-y-6 mt-4">
-                {/* Bluetooth Section */}
-                <div className="space-y-4 border p-4 rounded-lg bg-blue-50/50">
-                  <div className="flex items-center justify-between">
-                    <h4 className="font-semibold text-sm text-blue-700 flex items-center gap-2">
-                      <Bluetooth className="w-4 h-4" />
-                      ค้นหา Bluetooth
-                    </h4>
-                    <Button variant="outline" size="sm" onClick={scanBluetooth} disabled={isScanning}>
-                      <RefreshCw className={`w-3 h-3 mr-2 ${isScanning ? 'animate-spin' : ''}`} />
-                      สแกนใหม่
-                    </Button>
+              <div className="space-y-4 mt-4">
+                {isScanning ? (
+                  <div className="flex flex-col items-center justify-center py-8">
+                    <RefreshCw className="w-8 h-8 text-blue-500 animate-spin mb-4" />
+                    <p className="text-slate-600">กำลังค้นหาอุปกรณ์...</p>
                   </div>
-                  
-                  <div className="flex flex-col gap-2 max-h-[200px] overflow-y-auto bg-white rounded border p-2">
-                    {isScanning ? (
-                      <div className="flex flex-col items-center justify-center py-6 text-slate-500">
-                        <RefreshCw className="w-6 h-6 animate-spin mb-2 text-blue-500" />
-                        <p className="text-sm">กำลังสแกน...</p>
-                      </div>
-                    ) : bluetoothDevices.length > 0 ? (
-                      bluetoothDevices.map((device, idx) => (
-                        <div key={idx} className="flex items-center justify-between p-2 border rounded hover:bg-slate-50 text-sm">
-                          <div className="overflow-hidden">
-                            <p className="font-medium text-slate-900 truncate">{device.name || "Unknown Device"}</p>
-                            <p className="text-xs text-slate-500">{device.address}</p>
-                          </div>
-                          <Button size="sm" onClick={() => connectBluetooth(device)} disabled={connectingAddress === device.address}>
-                            {connectingAddress === device.address ? (
-                              <><RefreshCw className="w-3 h-3 mr-1 animate-spin" /> กำลังเชื่อมต่อ...</>
-                            ) : "เชื่อมต่อ"}
-                          </Button>
+                ) : (
+                  <>
+                    <div className="mb-2 p-3 bg-slate-50 border border-slate-200 rounded-lg">
+                      <Label className="text-sm font-semibold mb-2 block">เครื่องที่พบ (ออนไลน์)</Label>
+                      {Object.keys(nodeStatus).filter(id => nodeStatus[id]).length > 0 ? (
+                        <div className="flex flex-wrap gap-2 mt-2">
+                          {Object.keys(nodeStatus).filter(id => nodeStatus[id]).map(id => (
+                            <Badge 
+                              key={id} 
+                              variant={newFeeder.id === id ? "default" : "outline"}
+                              className="cursor-pointer hover:bg-blue-100"
+                              onClick={() => setNewFeeder({ ...newFeeder, id })}
+                            >
+                              Node {id}
+                            </Badge>
+                          ))}
                         </div>
-                      ))
+                      ) : (
+                        <p className="text-sm text-slate-500 mt-1">ไม่พบเครื่องให้อาหารที่ออนไลน์</p>
+                      )}
+                    </div>
+                    
+                    <div>
+                      <Label>Node ID (เลือกจากด้านบน หรือกรอกเอง)</Label>
+                      <Input 
+                        placeholder="เช่น 1, 2, 3" 
+                        value={newFeeder.id}
+                        onChange={(e) => setNewFeeder({ ...newFeeder, id: e.target.value })}
+                      />
+                    </div>
+                    <div>
+                      <Label>ชื่อเครื่องให้อาหาร</Label>
+                      <Input 
+                        placeholder="เช่น บ่ออนุบาล, บ่อกลาง" 
+                        value={newFeeder.name}
+                        onChange={(e) => setNewFeeder({ ...newFeeder, name: e.target.value })}
+                      />
+                    </div>
+                    <div>
+                      <Label>ประเภทอุปกรณ์</Label>
+                      <select 
+                        className="flex h-10 w-full items-center justify-between rounded-md border border-slate-200 bg-white px-3 py-2 text-sm mt-1"
+                        value={newFeeder.type}
+                        onChange={(e) => setNewFeeder({ ...newFeeder, type: e.target.value })}
+                      >
+                        <option value="feeder">เครื่องให้อาหาร</option>
+                        <option value="dispenser">เครื่องใส่สาร</option>
+                      </select>
+                    </div>
+                    {newFeeder.type === "feeder" ? (
+                      <>
+                        <div>
+                          <Label>ความจุสูงสุดถังอาหาร (กรัม)</Label>
+                          <Input 
+                            type="number" 
+                            placeholder="10000" 
+                            value={newFeeder.capacity}
+                            onChange={(e) => setNewFeeder({ ...newFeeder, capacity: e.target.value })}
+                          />
+                          <p className="text-xs text-slate-400 mt-1">* ปริมาณคงเหลือจะอ่านจาก Loadcell อัตโนมัติ</p>
+                        </div>
+                      </>
                     ) : (
-                      <div className="text-center py-6 text-slate-500 text-sm border border-dashed rounded bg-slate-50">
-                        ไม่พบอุปกรณ์
-                      </div>
+                      <>
+                        <div>
+                          <Label>ความจุสูงสุดถังกากน้ำตาล (กรัม)</Label>
+                          <Input 
+                            type="number" 
+                            placeholder="5000" 
+                            value={newFeeder.capacityMolasses}
+                            onChange={(e) => setNewFeeder({ ...newFeeder, capacityMolasses: e.target.value })}
+                          />
+                        </div>
+                        <div>
+                          <Label>ความจุสูงสุดถังปูนขาว (กรัม)</Label>
+                          <Input 
+                            type="number" 
+                            placeholder="5000" 
+                            value={newFeeder.capacityLime}
+                            onChange={(e) => setNewFeeder({ ...newFeeder, capacityLime: e.target.value })}
+                          />
+                        </div>
+                        <p className="text-xs text-slate-400">* ปริมาณคงเหลือจะอ่านจาก Loadcell อัตโนมัติ</p>
+                      </>
                     )}
-                  </div>
-                </div>
+                    <Button className="w-full bg-blue-600 hover:bg-blue-700" onClick={handleAddFeeder}>
+                      บันทึก
+                    </Button>
+                  </>
+                )}
               </div>
             </DialogContent>
           </Dialog>
         </div>
 
-        {feeders.length === 0 && connectedBluetooth.length === 0 ? (
+        {feeders.length === 0 ? (
           <div className="text-center py-6 text-slate-500 border border-dashed border-slate-200 rounded-lg">
             ยังไม่มีเครื่องให้อาหารในระบบ กดปุ่ม "เพิ่มเครื่อง" เพื่อเพิ่มอุปกรณ์
           </div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
             {feeders.map(feeder => {
-              const percentage = (feeder.remainingFeed / feeder.capacity) * 100;
               return (
                 <div key={feeder.id} className="p-4 rounded-xl border border-slate-200 bg-white shadow-sm flex flex-col justify-between">
                   <div>
                     <div className="flex items-center justify-between mb-3">
                       <div className="flex items-center gap-2">
-                        <div className={`w-2.5 h-2.5 rounded-full ${feeder.status ? 'bg-green-500 animate-pulse' : 'bg-slate-400'}`} />
-                        <span className="font-semibold text-slate-800">{feeder.name}</span>
+                        <div className={`p-1.5 rounded-lg ${feeder.status ? 'bg-blue-100 text-blue-600' : 'bg-slate-100 text-slate-400'}`}>
+                          <Fish className="w-4 h-4" />
+                        </div>
+                        <span className="font-semibold text-slate-800 flex items-center gap-2">
+                          {feeder.name}
+                          <span className="text-xs font-normal text-slate-500 bg-slate-100 px-2 py-0.5 rounded-full">Node {feeder.id}</span>
+                        </span>
+                        <div className="flex items-center gap-1.5 ml-2 border-l border-slate-200 pl-3">
+                          <span className={`inline-block w-2.5 h-2.5 rounded-full ${nodeStatus[feeder.id] ? 'bg-green-500' : 'bg-red-500'}`} />
+                          <span className="text-xs font-medium text-slate-600">
+                            {nodeStatus[feeder.id] ? 'Online' : 'Offline'}
+                          </span>
+                        </div>
                       </div>
                       <div className="flex items-center gap-2">
                         <Switch 
@@ -510,19 +402,68 @@ export default function Feeding({
                       </div>
                     </div>
 
-                    <div className="mb-4">
-                      <div className="flex justify-between text-xs text-slate-500 mb-1">
-                        <span>อาหารคงเหลือ</span>
-                        <span>{feeder.remainingFeed.toFixed(1)} / {feeder.capacity.toFixed(1)} kg ({percentage.toFixed(0)}%)</span>
-                      </div>
-                      <div className="h-2 bg-slate-100 rounded-full overflow-hidden">
-                        <div 
-                          className={`h-full rounded-full transition-all ${
-                            percentage < 20 ? 'bg-red-500' : percentage < 50 ? 'bg-amber-500' : 'bg-green-500'
-                          }`}
-                          style={{ width: `${percentage}%` }}
-                        />
-                      </div>
+                    <div className="mb-4 space-y-2">
+                      {feeder.type === 'dispenser' ? (
+                        <>
+                          <div className="flex justify-between items-end">
+                            <span className="text-xs text-slate-500">กากน้ำตาล</span>
+                            <div className="text-right">
+                              <span className="text-xl font-bold text-slate-800">
+                                {(nodeData?.[feeder.id]?.weight_molasses ?? nodeData?.[feeder.id]?.weight_m ?? '—').toLocaleString !== undefined 
+                                  ? Number(nodeData?.[feeder.id]?.weight_molasses ?? nodeData?.[feeder.id]?.weight_m ?? 0).toLocaleString('en-US', { maximumFractionDigits: 0 })
+                                  : '—'}
+                              </span>
+                              <span className="text-sm text-slate-400 ml-1">/ {(feeder.capacityMolasses || 0).toLocaleString('en-US', { maximumFractionDigits: 0 })}</span>
+                              <span className="text-sm text-slate-500 ml-1">กรัม</span>
+                            </div>
+                          </div>
+                          <div className="w-full bg-slate-100 rounded-full h-1.5">
+                            <div 
+                              className="bg-amber-500 h-1.5 rounded-full transition-all" 
+                              style={{ width: `${Math.min(100, ((nodeData?.[feeder.id]?.weight_molasses ?? nodeData?.[feeder.id]?.weight_m ?? 0) / (feeder.capacityMolasses || 1)) * 100)}%` }}
+                            />
+                          </div>
+                          <div className="flex justify-between items-end mt-2">
+                            <span className="text-xs text-slate-500">ปูนขาว</span>
+                            <div className="text-right">
+                              <span className="text-xl font-bold text-slate-800">
+                                {(nodeData?.[feeder.id]?.weight_lime ?? nodeData?.[feeder.id]?.weight_l ?? '—').toLocaleString !== undefined 
+                                  ? Number(nodeData?.[feeder.id]?.weight_lime ?? nodeData?.[feeder.id]?.weight_l ?? 0).toLocaleString('en-US', { maximumFractionDigits: 0 })
+                                  : '—'}
+                              </span>
+                              <span className="text-sm text-slate-400 ml-1">/ {(feeder.capacityLime || 0).toLocaleString('en-US', { maximumFractionDigits: 0 })}</span>
+                              <span className="text-sm text-slate-500 ml-1">กรัม</span>
+                            </div>
+                          </div>
+                          <div className="w-full bg-slate-100 rounded-full h-1.5">
+                            <div 
+                              className="bg-gray-400 h-1.5 rounded-full transition-all" 
+                              style={{ width: `${Math.min(100, ((nodeData?.[feeder.id]?.weight_lime ?? nodeData?.[feeder.id]?.weight_l ?? 0) / (feeder.capacityLime || 1)) * 100)}%` }}
+                            />
+                          </div>
+                        </>
+                      ) : (
+                        <>
+                          <div className="flex justify-between items-end">
+                            <span className="text-xs text-slate-500">อาหารคงเหลือ</span>
+                            <div className="text-right">
+                              <span className="text-xl font-bold text-slate-800">
+                                {nodeData?.[feeder.id]?.weight !== undefined 
+                                  ? Number(nodeData[feeder.id].weight).toLocaleString('en-US', { maximumFractionDigits: 0 })
+                                  : '—'}
+                              </span>
+                              <span className="text-sm text-slate-400 ml-1">/ {((feeder.capacity || 0) * 1000).toLocaleString('en-US', { maximumFractionDigits: 0 })}</span>
+                              <span className="text-sm text-slate-500 ml-1">กรัม</span>
+                            </div>
+                          </div>
+                          <div className="w-full bg-slate-100 rounded-full h-1.5">
+                            <div 
+                              className="bg-blue-500 h-1.5 rounded-full transition-all" 
+                              style={{ width: `${Math.min(100, ((nodeData?.[feeder.id]?.weight ?? 0) / ((feeder.capacity || 1) * 1000)) * 100)}%` }}
+                            />
+                          </div>
+                        </>
+                      )}
                     </div>
                   </div>
 
@@ -531,15 +472,38 @@ export default function Feeding({
                       ให้ล่าสุด: {feeder.lastFed || '—'}
                     </div>
                     <div className="flex gap-2">
-                      <Button 
-                        size="sm" 
-                        variant="outline" 
-                        onClick={() => handleQuickFeed(feeder.id)}
-                        disabled={feeder.remainingFeed <= 0}
-                        className="text-xs"
-                      >
-                        ให้อาหารด่วน
-                      </Button>
+                      {feeder.type === 'dispenser' ? (
+                        <>
+                          <Button 
+                            size="sm" 
+                            variant="outline" 
+                            onClick={() => handleQuickDispense(feeder.id, 'molasses')}
+                            disabled={(feeder.remainingMolasses || 0) <= 0}
+                            className="text-xs"
+                          >
+                            ให้กากน้ำตาล
+                          </Button>
+                          <Button 
+                            size="sm" 
+                            variant="outline" 
+                            onClick={() => handleQuickDispense(feeder.id, 'lime')}
+                            disabled={(feeder.remainingLime || 0) <= 0}
+                            className="text-xs"
+                          >
+                            ให้ปูนขาว
+                          </Button>
+                        </>
+                      ) : (
+                        <Button 
+                          size="sm" 
+                          variant="outline" 
+                          onClick={() => handleQuickFeed(feeder.id)}
+                          disabled={(feeder.remainingFeed || 0) <= 0}
+                          className="text-xs"
+                        >
+                          ให้อาหารด่วน
+                        </Button>
+                      )}
                       <AlertDialog>
                         <AlertDialogTrigger asChild>
                           <Button size="sm" variant="ghost" className="text-slate-400 hover:text-red-500 p-2">
@@ -557,99 +521,6 @@ export default function Feeding({
                             <AlertDialogCancel>ยกเลิก</AlertDialogCancel>
                             <AlertDialogAction onClick={() => handleDeleteFeeder(feeder.id)} className="bg-red-600 hover:bg-red-700">
                               ลบ
-                            </AlertDialogAction>
-                          </AlertDialogFooter>
-                        </AlertDialogContent>
-                      </AlertDialog>
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-
-            {/* Bluetooth Connected Feeders */}
-            {connectedBluetooth.map((device) => {
-              const isOn = device.status;
-              const isEditing = editingDeviceAddress === device.address;
-              
-              return (
-                <div key={device.address} className="p-4 rounded-xl border border-blue-200 bg-blue-50/30 shadow-sm flex flex-col justify-between">
-                  <div>
-                    <div className="flex items-center justify-between mb-3">
-                      <div className="flex items-center gap-2">
-                        <div className={`p-1.5 rounded-lg ${isOn ? "bg-blue-100 text-blue-600" : "bg-slate-100 text-slate-400"}`}>
-                          <Bluetooth className="w-4 h-4" />
-                        </div>
-                        {isEditing ? (
-                          <div className="flex items-center gap-1">
-                            <Input 
-                              size={12}
-                              className="h-7 text-sm py-1 px-2 w-32" 
-                              value={editingDeviceName} 
-                              onChange={e => setEditingDeviceName(e.target.value)} 
-                              autoFocus
-                            />
-                            <Button size="icon" variant="ghost" className="h-7 w-7 text-green-600" onClick={() => handleRenameBluetooth(device.address)}>
-                              <Check className="w-4 h-4" />
-                            </Button>
-                            <Button size="icon" variant="ghost" className="h-7 w-7 text-red-500" onClick={() => setEditingDeviceAddress(null)}>
-                              <X className="w-4 h-4" />
-                            </Button>
-                          </div>
-                        ) : (
-                          <div className="flex items-center gap-2 group cursor-pointer" onClick={() => {
-                            setEditingDeviceAddress(device.address);
-                            setEditingDeviceName(device.name || "");
-                          }}>
-                            <span className="font-semibold text-blue-900">{device.name || "Bluetooth Feeder"}</span>
-                            <Edit2 className="w-3 h-3 text-slate-300 group-hover:text-blue-500 transition-colors" />
-                          </div>
-                        )}
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <Input 
-                          type="number" 
-                          min="1" 
-                          placeholder="วิ" 
-                          className="w-16 h-8 text-sm"
-                          value={feedDurations[device.address] || "3"}
-                          onChange={(e) => setFeedDurations(prev => ({ ...prev, [device.address]: e.target.value }))}
-                          disabled={isOn}
-                        />
-                        <Button 
-                          size="sm" 
-                          className="h-8"
-                          onClick={() => feedBluetoothDevice(device.address)}
-                          disabled={isOn}
-                        >
-                          {isOn ? "กำลังทำงาน..." : "ให้อาหาร"}
-                        </Button>
-                      </div>
-                    </div>
-                    <div className="mb-4">
-                       <p className="text-xs text-slate-500 font-mono">{device.address}</p>
-                    </div>
-                  </div>
-
-                  <div className="flex items-center justify-end pt-2 border-t border-blue-100">
-                    <div className="flex gap-2">
-                      <AlertDialog>
-                        <AlertDialogTrigger asChild>
-                          <Button size="sm" variant="ghost" className="text-slate-400 hover:text-red-500 p-2">
-                            <Trash2 className="w-4 h-4" />
-                          </Button>
-                        </AlertDialogTrigger>
-                        <AlertDialogContent>
-                          <AlertDialogHeader>
-                            <AlertDialogTitle>ยกเลิกการเชื่อมต่อ?</AlertDialogTitle>
-                            <AlertDialogDescription>
-                              คุณแน่ใจว่าต้องการตัดการเชื่อมต่อ {device.name || device.address} หรือไม่?
-                            </AlertDialogDescription>
-                          </AlertDialogHeader>
-                          <AlertDialogFooter>
-                            <AlertDialogCancel>ยกเลิก</AlertDialogCancel>
-                            <AlertDialogAction onClick={() => disconnectBluetoothDevice(device.address)} className="bg-red-600 hover:bg-red-700">
-                              ตัดการเชื่อมต่อ
                             </AlertDialogAction>
                           </AlertDialogFooter>
                         </AlertDialogContent>

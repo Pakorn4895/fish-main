@@ -7,6 +7,7 @@ import {
   Wind,
   Droplets,
   Fish,
+  Bluetooth,
 } from "lucide-react";
 import { Card } from "./ui/card";
 import { Badge } from "./ui/badge";
@@ -38,7 +39,7 @@ export default function DeviceControl({
   feeders: Feeder[],
   setFeeders: React.Dispatch<React.SetStateAction<Feeder[]>>,
 }) {
-  const { data: sensor, isConnected, isMockMode, sendCommand } = useSensorData();
+  const { data: sensor, isConnected, isMockMode, sendCommand, nodeStatus } = useSensorData();
   const [autoMode, setAutoMode] = useState(false);
 
   // Mirror device states from live sensor data
@@ -248,16 +249,24 @@ export default function DeviceControl({
                 <div key={feeder.id} className={`p-4 rounded-xl border-2 transition-all ${isOn ? "bg-blue-50 border-blue-200" : "bg-slate-50 border-slate-200"
                   }`}>
                   <div className="flex items-center justify-between mb-3">
-                    <div className={`p-2 rounded-lg ${isOn ? "bg-blue-100" : "bg-slate-100"}`}>
-                      <Fish className={`w-5 h-5 ${isOn ? "text-blue-600" : "text-slate-400"}`} />
+                    <div className="flex items-center gap-2">
+                      <div className={`p-2 rounded-lg ${isOn ? "bg-blue-100" : "bg-slate-100"}`}>
+                        <Fish className={`w-5 h-5 ${isOn ? "text-blue-600" : "text-slate-400"}`} />
+                      </div>
+                      <div className="flex items-center gap-1.5 ml-1">
+                        <span className={`inline-block w-2.5 h-2.5 rounded-full ${nodeStatus[feeder.id] ? 'bg-green-500' : 'bg-red-500'}`} />
+                        <span className="text-xs font-medium text-slate-600">
+                          {nodeStatus[feeder.id] ? 'Online' : 'Offline'}
+                        </span>
+                      </div>
                     </div>
                     <Switch
                       checked={isOn}
                       onCheckedChange={() => toggleFeeder(feeder.id, feeder.status)}
-                      disabled={autoMode}
+                      disabled={autoMode || !nodeStatus[feeder.id]}
                     />
                   </div>
-                  <p className="font-semibold text-slate-800">{feeder.name}</p>
+                  <p className="font-semibold text-slate-800">Node {feeder.id}: {feeder.name}</p>
                   <div className="mt-2 mb-1">
                     <div className="flex justify-between text-[11px] text-slate-500 mb-0.5">
                       <span>อาหารคงเหลือ</span>

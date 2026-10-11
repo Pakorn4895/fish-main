@@ -1,0 +1,510 @@
+diff --git a/main.py b/main.py
+index 8c545cb..6399813 100644
+--- a/main.py
++++ b/main.py
+@@ -14,17 +14,8 @@ from fastapi.staticfiles import StaticFiles
+ from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+ from fastapi.websockets import WebSocket, WebSocketDisconnect
+ import serial.tools.list_ports
+-from dotenv import load_dotenv
+ from pydantic import BaseModel
+-from bleak import BleakScanner, BleakClient
+-
+-# Global dict to hold active BLE connections
+-ble_clients = {}
+-
+-class BleControlRequest(BaseModel):
+-    action: str
+-    address: str
+-    name: str | None = None
++from dotenv import load_dotenv
+ 
+ # โหลดค่าจากไฟล์ .env
+ load_dotenv()
+@@ -32,14 +23,15 @@ load_dotenv()
+ # ==========================================
+ # 1. การตั้งค่าระบบ (Configuration)
+ # ==========================================
+-def auto_detect_serial_port():
++def auto_detect_serial_ports():
+     ports = serial.tools.list_ports.comports()
++    detected = []
+     for port in ports:
+         if "ACM" in port.device or "USB" in port.device:
+-            return port.device
+-    return None
++            detected.append(port.device)
++    return detected
+ 
+-SERIAL_PORT = os.environ.get('SERIAL_PORT', auto_detect_serial_port())
++SERIAL_PORT_ENV = os.environ.get('SERIAL_PORT')
+ BAUD_RATE = 115200
+ TARGET_DEVICE_ID = os.getenv('TARGET_DEVICE_ID', 'UNO_001')
+ DB_FILE = 'fishpond.db'
+@@ -73,7 +65,6 @@ async def add_security_headers(request, call_next):
+     return response
+ 
+ active_connections = set()  
+-ser = None
+ latest_data = {}
+ ENABLE_MOCK_DATA = False
+ 
+@@ -133,6 +124,7 @@ def send_line_alert(user_id, message):
+ def process_sensor_data(data):
+     global last_line_alert_times, last_db_alert_times
+     try:
++        device_id = data.get('device_id', TARGET_DEVICE_ID)
+         temp_val = data.get('wat_t', data.get('temp'))
+         ph_val = data.get('ph')
+         do_val = data.get('do')
+@@ -157,30 +149,42 @@ def process_sensor_data(data):
+             FROM devices d
+             JOIN users u ON d.owner_id = u.user_id
+             WHERE d.device_id = ?
+-        ''', (TARGET_DEVICE_ID,))
++        ''', (device_id,))
+         result = cursor.fetchone()
++        
++        if not result:
++            cursor.execute("INSERT OR IGNORE INTO devices (device_id, owner_id, pond_name, location) VALUES (?, 1, ?, 'ยังไม่ระบุ')", (device_id, f'บ่อ {device_id}'))
++            cursor.execute('''
++                SELECT u.line_user_id 
++                FROM devices d
++                JOIN users u ON d.owner_id = u.user_id
++                WHERE d.device_id = ?
++            ''', (device_id,))
++            result = cursor.fetchone()
++            
+         line_user_id = result[0] if result and result[0] else None
+ 
+         current_time = time.time()
+-        line_cooldown = 30 * 60
++        line_cooldown = 24 * 60 * 60  # 1 วัน
+         db_cooldown = 60
+ 
+         def trigger_alert(sensor_name, msg, event_type='WARNING'):
+-            if current_time - last_db_alert_times.get(sensor_name, 0) > db_cooldown:
+-                cursor.execute("INSERT INTO system_events (device_id, event_type, message) VALUES (?, ?, ?)", (TARGET_DEVICE_ID, event_type, msg))
+-                last_db_alert_times[sensor_name] = current_time
++            db_key = f"{device_id}_{sensor_name}"
++            if current_time - last_db_alert_times.get(db_key, 0) > db_cooldown:
++                cursor.execute("INSERT INTO system_events (device_id, event_type, message) VALUES (?, ?, ?)", (device_id, event_type, msg))
++                last_db_alert_times[db_key] = current_time
+             
+-            if current_time - last_line_alert_times.get(sensor_name, 0) > line_cooldown:
++            if current_time - last_line_alert_times.get(db_key, 0) > line_cooldown:
+                 if line_user_id: 
+-                    send_line_alert(line_user_id, msg)
+-                last_line_alert_times[sensor_name] = current_time
++                    send_line_alert(line_user_id, f"[{device_id}] {msg}")
++                last_line_alert_times[db_key] = current_time
+ 
+         if temp is None:
+-            if current_time - last_db_alert_times.get("system_disconnect", 0) > 3600:
++            if current_time - last_db_alert_times.get(f"{device_id}_system_disconnect", 0) > 3600:
+                 trigger_alert("system_disconnect", "เตือนภัย! เซนเซอร์ขาดการเชื่อมต่อ กรุณาตรวจสอบอุปกรณ์", "ALERT")
+         else:
+-            last_db_alert_times["system_disconnect"] = 0
+-            last_line_alert_times["system_disconnect"] = 0
++            last_db_alert_times[f"{device_id}_system_disconnect"] = 0
++            last_line_alert_times[f"{device_id}_system_disconnect"] = 0
+             
+             if temp > 0 and (temp < 20.0 or temp > 35.0):
+                 trigger_alert("temp", f"เตือนภัย! อุณหภูมิน้ำผิดปกติ ({temp:.1f}°C) - ควรอยู่ระหว่าง 20-35°C", "ALERT")
+@@ -206,7 +210,7 @@ def process_sensor_data(data):
+             cursor.execute('''
+                 INSERT INTO sensor_logs (device_id, temperature, ph_level, do_level, turbidity)
+                 VALUES (?, ?, ?, ?, ?)
+-            ''', (TARGET_DEVICE_ID, temp, ph, do_level, turbidity))
++            ''', (device_id, temp, ph, do_level, turbidity))
+ 
+         conn.commit()
+         conn.close()
+@@ -214,24 +218,10 @@ def process_sensor_data(data):
+         print(f"⚠️ การบันทึก DB มีปัญหา: {e}")
+ 
+ # ==========================================
+-# 3. การเชื่อมต่อ Serial และ เธรดเบื้องหลัง
++# 3. การเชื่อมต่อ Serial และ เธรดเบื้องหลัง (Multi-Port)
+ # ==========================================
+-def connect_serial():
+-    global ser
+-    if SERIAL_PORT is None:
+-        print("❌ ไม่พบพอร์ตเชื่อมต่อ Arduino ในระบบขณะนี้")
+-        ser = None
+-        return
+-    try:
+-        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+-        print(f"✅ เชื่อมต่อสาย USB สำเร็จ พอร์ต: {SERIAL_PORT}")
+-    except Exception as e:
+-        print(f"❌ ไม่สามารถเชื่อมต่อพอร์ต {SERIAL_PORT} ได้: {e}")
+-        ser = None
++active_serials = {}
+ 
+-connect_serial()
+-
+-# ฟังก์ชันตัวกลางสำหรับใช้ส่งข้อมูลข้าม Thread ไปหา WebSocket clients อย่างปลอดภัย
+ def safe_broadcast_to_web(message_str):
+     if main_loop and active_connections:
+         async def send_all():
+@@ -247,98 +237,128 @@ async def broadcast(data_dict):
+     latest_data = data_dict
+     message = json.dumps({"type": "sensorData", "data": data_dict})
+     
+-    # ประมวลผลและบันทึกลงฐานข้อมูลแยกเบื้องหลัง
+     threading.Thread(target=process_sensor_data, args=(data_dict,), daemon=True).start()
+     
+-    # ส่งสัญญาณหา Client ทุกคน
+     for connection in list(active_connections):
+         try:
+             await connection.send_text(message)
+         except:
+             active_connections.remove(connection)
+ 
+-def serial_reader():
+-    global ser
+-    while True:
++async def broadcast_raw(message: str):
++    for connection in list(active_connections):
+         try:
+-            # 1. ตรวจสอบและพยายามเชื่อมต่อบอร์ดใหม่เมื่อสายหลุด
+-            if ser is None or not ser.is_open:
+-                current_port = auto_detect_serial_port()
+-                if current_port is None:
+-                    time.sleep(2)
+-                    continue
+-                print(f"🔄 กำลังพยายามเชื่อมต่อใหม่ที่พอร์ต: {current_port} ...")
+-                try:
+-                    ser = serial.Serial(current_port, BAUD_RATE, timeout=1)
+-                    print(f"🟢 กู้คืนระบบสำเร็จ! เชื่อมต่อพอร์ตใหม่สำเร็จ: {current_port}")
+-                    
+-                    status_msg = json.dumps({"type": "serverStatus", "mockMode": False, "arduinoConnected": True})
+-                    safe_broadcast_to_web(status_msg)
+-                    time.sleep(2)
+-                except:
+-                    ser = None
+-                    time.sleep(2)
+-                    continue
++            await connection.send_text(message)
++        except:
++            active_connections.remove(connection)
+ 
+-            # 2. ตรวจสอบข้อมูลในบัฟเฟอร์แบบปลอดภัย
+-            has_data = False
+-            try:
+-                if ser and ser.is_open:
+-                    if ser.in_waiting > 0:
+-                        has_data = True
+-            except (serial.SerialException, OSError) as e:
+-                print(f"⚠️ บอร์ดหลุดจริง (.in_waiting พัง): {e}")
+-                has_data = False
+-                if ser:
+-                    try: ser.close()
+-                    except: pass
+-                ser = None
+-                
+-                status_msg = json.dumps({"type": "serverStatus", "mockMode": ENABLE_MOCK_DATA, "arduinoConnected": False})
+-                safe_broadcast_to_web(status_msg)
+-                
+-                if not ENABLE_MOCK_DATA:
+-                    zero_data = {
+-                        "temp": None, "ph": None, "do": None, "ec": None, "turbidity": None, "level": None, "humidity": None, "mock": False
+-                    }
+-                    zero_msg = json.dumps({"type": "sensorData", "data": zero_data})
+-                    safe_broadcast_to_web(zero_msg)
+-                    # บันทึกสถานะระบบลง DB
+-                    threading.Thread(target=process_sensor_data, args=(zero_data,), daemon=True).start()
++def single_serial_reader(port_name):
++    ser = active_serials.get(port_name)
++    if not ser: return
++    
++    while True:
++        try:
++            if not ser.is_open:
++                break
+                 
+-                time.sleep(2)
+-                continue
+-
+-            # 3. การอ่านสัญญาณจากบอร์ด
+-            if has_data:
+-                try:
+-                    ser.reset_input_buffer()
+-                    ser.readline()  # โยนบรรทัดที่ขาดทิ้งไป
+-                    
+-                    raw_line = ser.readline().decode('utf-8', errors='ignore').strip()
+-                    if raw_line.startswith('{') and raw_line.endswith('}'):
+-                        data = json.loads(raw_line)
++            if ser.in_waiting > 0:
++                raw_line = ser.readline().decode('utf-8', errors='ignore').strip()
++                if raw_line.startswith('{') and raw_line.endswith('}'):
++                    data = json.loads(raw_line)
++                    if "action" in data and data["action"] == "node_status":
++                        node_id = str(data.get("node_id", ""))
++                        status = data.get("status", "")
++                        if status == "online":
++                            node_last_seen[node_id] = time.time()
++                            node_ui_offline_sent[node_id] = False
++                            node_line_alert_sent[node_id] = False
++                        if main_loop and active_connections:
++                            msg = json.dumps({"type": "nodeStatus", "nodeId": node_id, "status": status})
++                            asyncio.run_coroutine_threadsafe(broadcast_raw(msg), main_loop)
++                    else:
+                         data["mock"] = False
+-                        
+-                        # ใช้หลัก Thread-safe ในการส่งข้อมูลข้ามไปยัง WebSocket Loop หลัก
+                         if main_loop and active_connections:
+                             asyncio.run_coroutine_threadsafe(broadcast(data), main_loop)
+-                except Exception as e:
+-                    print(f"⚠️ [Data Read Error]: {e}")
+-                
+-                time.sleep(1)
+             else:
+                 time.sleep(0.1)
+                 
+         except (serial.SerialException, OSError, Exception) as e:
+-            print(f"⚠️ [Serial Error] เกิดข้อผิดพลาดภาพรวม: {e}")
+-            if ser:
+-                try: ser.close()
+-                except: pass
+-                ser = None
+-            time.sleep(2)
++            print(f"⚠️ [Serial Error] พอร์ต {port_name} หลุด: {e}")
++            break
++            
++    try: ser.close()
++    except: pass
++    active_serials[port_name] = None
++    
++    any_connected = any(s is not None and s.is_open for s in active_serials.values())
++    if not any_connected:
++        status_msg = json.dumps({"type": "serverStatus", "mockMode": ENABLE_MOCK_DATA, "arduinoConnected": False})
++        safe_broadcast_to_web(status_msg)
++        if not ENABLE_MOCK_DATA:
++            zero_data = {
++                "temp": None, "ph": None, "do": None, "ec": None, "turbidity": None, "level": None, "humidity": None, "mock": False
++            }
++            zero_msg = json.dumps({"type": "sensorData", "data": zero_data})
++            safe_broadcast_to_web(zero_msg)
++            threading.Thread(target=process_sensor_data, args=(zero_data,), daemon=True).start()
+ 
+-threading.Thread(target=serial_reader, daemon=True).start()
++def port_manager():
++    while True:
++        current_ports = auto_detect_serial_ports()
++        
++        # Override with ENV if specified and exists
++        if SERIAL_PORT_ENV and SERIAL_PORT_ENV in current_ports:
++            current_ports = [SERIAL_PORT_ENV]
++
++        for p in current_ports:
++            if p not in active_serials or active_serials[p] is None:
++                try:
++                    s = serial.Serial(p, BAUD_RATE, timeout=1)
++                    active_serials[p] = s
++                    print(f"🟢 เชื่อมต่อพอร์ตใหม่สำเร็จ: {p}")
++                    status_msg = json.dumps({"type": "serverStatus", "mockMode": ENABLE_MOCK_DATA, "arduinoConnected": True})
++                    safe_broadcast_to_web(status_msg)
++                    threading.Thread(target=single_serial_reader, args=(p,), daemon=True).start()
++                except Exception as e:
++                    pass
++        time.sleep(2)
++
++threading.Thread(target=port_manager, daemon=True).start()
++
++node_last_seen = {}
++node_ui_offline_sent = {}
++node_line_alert_sent = {}
++
++def node_watchdog():
++    while True:
++        current_time = time.time()
++        for node_id, last_time in list(node_last_seen.items()):
++            time_offline = current_time - last_time
++            
++            # Update UI immediately after 25s
++            if time_offline > 25 and not node_ui_offline_sent.get(node_id, False):
++                if main_loop and active_connections:
++                    msg = json.dumps({"type": "nodeStatus", "nodeId": node_id, "status": "offline"})
++                    asyncio.run_coroutine_threadsafe(broadcast_raw(msg), main_loop)
++                node_ui_offline_sent[node_id] = True
++            
++            # Send LINE alert after 1 day (86400 seconds)
++            if time_offline > 86400 and not node_line_alert_sent.get(node_id, False):
++                try:
++                    with sqlite3.connect('database.db', check_same_thread=False) as conn:
++                        cursor = conn.cursor()
++                        cursor.execute('SELECT line_user_id FROM users WHERE user_id = 1')
++                        res = cursor.fetchone()
++                        if res and res[0]:
++                            send_line_alert(res[0], f"⚠️ แจ้งเตือน: เครื่องให้อาหารบ่อที่ {node_id} ขาดการเชื่อมต่อ!")
++                except Exception as e:
++                    print(f"Watchdog DB error: {e}")
++                
++                node_line_alert_sent[node_id] = True
++                
++        time.sleep(5)
++
++threading.Thread(target=node_watchdog, daemon=True).start()
+ 
+ # ==========================================
+ # 4. API และ WebSocket Endpoints (FastAPI)
+@@ -353,7 +373,8 @@ mock_device_state = {
+ async def mock_broadcaster():
+     global ENABLE_MOCK_DATA, mock_device_state
+     while True:
+-        if ser is None and ENABLE_MOCK_DATA:
++        any_connected = any(s is not None and s.is_open for s in active_serials.values())
++        if not any_connected and ENABLE_MOCK_DATA:
+             mock_data = {
+                 "temp": 28.5,      
+                 "ph": 4.5,         
+@@ -380,13 +401,14 @@ async def get_mock_setting():
+ 
+ @app.post("/api/settings/mock")
+ async def set_mock_setting(config: MockConfig):
+-    global ENABLE_MOCK_DATA, last_line_alert_times, last_db_alert_times, ser, active_connections
++    global ENABLE_MOCK_DATA, last_line_alert_times, last_db_alert_times, active_connections
+     ENABLE_MOCK_DATA = config.enabled
+     last_line_alert_times.clear()
+     last_db_alert_times.clear()
+     
+     if not ENABLE_MOCK_DATA:
+-        if ser is None and active_connections:
++        any_connected = any(s is not None and s.is_open for s in active_serials.values())
++        if not any_connected and active_connections:
+             zero_data = {
+                 "temp": None, "ph": None, "do": None, "ec": None, "turbidity": None, "level": None, "humidity": None, "mock": False
+             }
+@@ -466,7 +488,7 @@ async def websocket_endpoint(websocket: WebSocket):
+     await websocket.accept()
+     active_connections.add(websocket)
+     
+-    is_arduino_active = ser is not None and ser.is_open
++    is_arduino_active = any(s is not None and s.is_open for s in active_serials.values())
+     
+     await websocket.send_text(json.dumps({
+         "type": "serverStatus", 
+@@ -491,18 +513,26 @@ async def websocket_endpoint(websocket: WebSocket):
+                 if web_json.get("action") == "controlDevice":
+                     cmd_data = web_json.get("data", {})
+                     
+-                    if ser:
++                    any_connected = any(s is not None and s.is_open for s in active_serials.values())
++                    if any_connected:
+                         if "buzzer" in cmd_data:
+                             is_muted = cmd_data['buzzer']
+                             serial_cmd = "MUTE_ON\n" if is_muted else "MUTE_OFF\n"
+                         elif cmd_data.get("device") == "buzzer":
+                             is_muted = cmd_data.get("state")
+                             serial_cmd = "MUTE_ON\n" if is_muted else "MUTE_OFF\n"
++                        elif cmd_data.get("device") == "scan":
++                            serial_cmd = "scan\n"
+                         else:
+-                            serial_cmd = json.dumps(cmd_data) + "\n"
++                            serial_cmd = json.dumps(cmd_data, separators=(',', ':')) + "\n"
+                         
+-                        ser.write(serial_cmd.encode('utf-8'))
+-                        print(f"📡 ส่งคำสั่งควบคุมไป Arduino: {serial_cmd.strip()}")
++                        for p, s in active_serials.items():
++                            if s and s.is_open:
++                                try:
++                                    s.write(serial_cmd.encode('utf-8'))
++                                except Exception as e:
++                                    print(f"⚠️ ส่งคำสั่งไปพอร์ต {p} ไม่สำเร็จ: {e}")
++                        print(f"📡 ส่งคำสั่งควบคุมไปบอร์ดทั้งหมด: {serial_cmd.strip()}")
+                         
+                     elif ENABLE_MOCK_DATA:
+                         device = cmd_data.get("device")
+@@ -523,87 +553,12 @@ async def websocket_endpoint(websocket: WebSocket):
+ dist_dir = os.path.join(os.path.dirname(__file__), "dist")
+ 
+ if os.path.isdir(dist_dir):
+-    # ยึด Assets หลักก่อน
+-    app.mount("/assets", StaticFiles(directory=os.path.join(dist_dir, "assets")), name="assets")
++    assets_dir = os.path.join(dist_dir, "assets")
++    if os.path.isdir(assets_dir):
++        # ยึด Assets หลักก่อน
++        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+ 
+     # สำหรับ Root Route (/) ส่งหน้าหลักตรง ๆ ป้องกันการซ้อนของ SPA Router 
+-    @app.get("/api/bluetooth/scan")
+-    async def scan_bluetooth():
+-        try:
+-            devices = await BleakScanner.discover(timeout=5.0)
+-            results = []
+-            for d in devices:
+-                results.append({
+-                    "name": d.name or "Unknown",
+-                    "address": d.address
+-                })
+-            return {"devices": results}
+-        except Exception as e:
+-            return JSONResponse(status_code=500, content={"error": str(e)})
+-
+-    @app.get("/api/bluetooth/status")
+-    async def status_bluetooth():
+-        results = []
+-        dead_clients = []
+-        for address, client in ble_clients.items():
+-            try:
+-                connected = client.is_connected
+-            except Exception:
+-                connected = False
+-            
+-            results.append({
+-                "address": address,
+-                "connected": connected
+-            })
+-            if not connected:
+-                dead_clients.append(address)
+-                
+-        # Clean up dead clients
+-        for address in dead_clients:
+-            del ble_clients[address]
+-            
+-        return {"devices": results}
+-
+-    @app.post("/api/bluetooth/control")
+-    async def control_bluetooth(payload: BleControlRequest):
+-        address = payload.address
+-        action = payload.action
+-        
+-        CHARACTERISTIC_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+-
+-        if action == "connect":
+-            if address not in ble_clients or not ble_clients[address].is_connected:
+-                client = BleakClient(address)
+-                try:
+-                    await client.connect()
+-                    ble_clients[address] = client
+-                    return {"status": "connected"}
+-                except Exception as e:
+-                    return JSONResponse(status_code=500, content={"error": str(e)})
+-            return {"status": "already_connected"}
+-            
+-        elif action == "on" or action == "off":
+-            if address in ble_clients and ble_clients[address].is_connected:
+-                val = b"1" if action == "on" else b"0"
+-                try:
+-                    await ble_clients[address].write_gatt_char(CHARACTERISTIC_UUID, val, response=True)
+-                    return {"status": "success"}
+-                except Exception as e:
+-                    return JSONResponse(status_code=500, content={"error": str(e)})
+-            else:
+-                return JSONResponse(status_code=400, content={"error": "Not connected"})
+-                
+-        elif action == "disconnect":
+-            if address in ble_clients:
+-                try:
+-                    await ble_clients[address].disconnect()
+-                except Exception:
+-                    pass
+-                del ble_clients[address]
+-            return {"status": "disconnected"}
+-            
+-        return JSONResponse(status_code=400, content={"error": "Unknown action"})
+-
+     @app.get("/", response_class=FileResponse)
+     async def serve_index():
+         return FileResponse(

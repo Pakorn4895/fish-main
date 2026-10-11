@@ -1,0 +1,513 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+
+// ==========================================
+// 1. ตั้งค่ารหัส Broadcast (ส่งหาทุก Node)
+// ==========================================
+uint8_t broadcastAddress[] = {
+  0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+};
+
+// ==========================================
+// 2. โครงสร้างข้อมูล
+//    ต้องตรงกับฝั่ง Node ลูก
+// ==========================================
+typedef struct struct_message {
+  int node_id;
+  int command;
+  int amount;
+} struct_message;
+
+struct_message myData;
+
+// ==========================================
+// โครงสร้าง Heartbeat (รับจาก Node)
+// ==========================================
+typedef struct struct_heartbeat {
+  int node_id;
+  bool is_online;
+} struct_heartbeat;
+
+struct_heartbeat heartbeatMsg;
+
+esp_now_peer_info_t peerInfo;
+
+// ==========================================
+// 3. ตัวแปรอ่าน Serial แบบ Non-blocking
+// ==========================================
+String inputBuffer = "";
+
+// ==========================================
+// 4. Callback แจ้งสถานะการส่ง ESP-NOW
+//
+// ESP32 Arduino Core 3.x ใช้:
+// const wifi_tx_info_t *tx_info
+// ==========================================
+void OnDataSent(
+  const wifi_tx_info_t *tx_info,
+  esp_now_send_status_t status
+) {
+
+  if (status == ESP_NOW_SEND_SUCCESS) {
+
+    Serial.println(
+      "{\"status\":\"espnow_ack\", "
+      "\"msg\":\"Packet delivered successfully\"}"
+    );
+
+  } else {
+
+    Serial.println(
+      "{\"status\":\"espnow_nack\", "
+      "\"msg\":\"Delivery failed (Node offline or out of range)\"}"
+    );
+  }
+}
+
+// ==========================================
+// ฟังก์ชันรับข้อมูล ESP-NOW (Heartbeat จาก Node)
+// ==========================================
+void OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_t *incomingData, int len) {
+  if (len == sizeof(struct_heartbeat)) {
+    memcpy(&heartbeatMsg, incomingData, sizeof(heartbeatMsg));
+    
+    // พิมพ์ JSON ส่งให้คอมพิวเตอร์ (main.py)
+    Serial.print("{\"action\":\"node_status\", \"node_id\":");
+    Serial.print(heartbeatMsg.node_id);
+    Serial.print(", \"status\":\"");
+    Serial.print(heartbeatMsg.is_online ? "online" : "offline");
+    Serial.println("\"}");
+  }
+}
+
+// ==========================================
+// 5. Setup
+// ==========================================
+void setup() {
+
+  Serial.begin(115200);
+
+  delay(500);
+
+  // ------------------------------------------
+  // ตั้งค่า WiFi เป็น Station
+  // ------------------------------------------
+  WiFi.mode(WIFI_STA);
+
+  WiFi.disconnect();
+
+  delay(100);
+
+  // ------------------------------------------
+  // ล็อก WiFi Channel = 6
+  //
+  // Node ลูกทุกตัวต้องใช้ Channel 6 เหมือนกัน
+  // ------------------------------------------
+  esp_err_t channelResult =
+    esp_wifi_set_channel(
+      6,
+      WIFI_SECOND_CHAN_NONE
+    );
+
+  if (channelResult != ESP_OK) {
+
+    Serial.println(
+      "{\"status\":\"error\", "
+      "\"msg\":\"Failed to set WiFi channel\"}"
+    );
+
+  }
+
+  // ------------------------------------------
+  // แสดงข้อมูล Gateway
+  // ------------------------------------------
+  Serial.println();
+  Serial.println("======================================");
+  Serial.println("      ESP-NOW GATEWAY");
+  Serial.println("======================================");
+
+  Serial.print("Gateway MAC Address: ");
+  Serial.println(WiFi.macAddress());
+
+  Serial.println("WiFi Channel: 6");
+
+  // ------------------------------------------
+  // เริ่มต้น ESP-NOW
+  // ------------------------------------------
+  if (esp_now_init() != ESP_OK) {
+
+    Serial.println(
+      "{\"status\":\"error\", "
+      "\"msg\":\"Error initializing ESP-NOW\"}"
+    );
+
+    return;
+  }
+
+  // ------------------------------------------
+  // ลงทะเบียน Callback ส่งและรับข้อมูล
+  // ------------------------------------------
+  esp_err_t callbackResult =
+    esp_now_register_send_cb(OnDataSent);
+
+  if (callbackResult != ESP_OK) {
+
+    Serial.println(
+      "{\"status\":\"error\", "
+      "\"msg\":\"Failed to register send callback\"}"
+    );
+
+    return;
+  }
+
+  if (esp_now_register_recv_cb(OnDataRecv) != ESP_OK) {
+    Serial.println(
+      "{\"status\":\"error\", "
+      "\"msg\":\"Failed to register recv callback\"}"
+    );
+  }
+
+  // ------------------------------------------
+  // เตรียมข้อมูล Peer
+  // ------------------------------------------
+  memset(
+    &peerInfo,
+    0,
+    sizeof(peerInfo)
+  );
+
+  // Broadcast MAC
+  memcpy(
+    peerInfo.peer_addr,
+    broadcastAddress,
+    6
+  );
+
+  // Channel 6
+  peerInfo.channel = 6;
+
+  // ไม่เข้ารหัส
+  peerInfo.encrypt = false;
+
+  // ------------------------------------------
+  // เพิ่ม Broadcast Peer
+  // ------------------------------------------
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+
+    Serial.println(
+      "{\"status\":\"error\", "
+      "\"msg\":\"Failed to add broadcast peer\"}"
+    );
+
+    return;
+  }
+
+  // ------------------------------------------
+  // พร้อมใช้งาน
+  // ------------------------------------------
+  Serial.println(
+    "{\"status\":\"ready\", "
+    "\"msg\":\"Gateway initialization complete\"}"
+  );
+
+  Serial.println(
+    "Waiting for commands from Serial..."
+  );
+
+  Serial.println(
+    "======================================"
+  );
+}
+
+
+// ==========================================
+// 6. ประมวลผลคำสั่งจาก Serial
+// ==========================================
+void processCommand(String input) {
+
+  input.trim();
+
+  if (input.length() == 0) {
+    return;
+  }
+  
+  // ---------- SCAN COMMAND ----------
+  if (input.equalsIgnoreCase("scan") || 
+      input.indexOf("\"command\":\"scan\"") >= 0 || 
+      input.indexOf("\"command\": \"scan\"") >= 0 || 
+      input.indexOf("\"action\":\"scanNodes\"") >= 0 ||
+      input.indexOf("\"action\": \"scanNodes\"") >= 0) {
+    Serial.println("{\"status\":\"scanning\", \"msg\":\"Broadcasting scan command\"}");
+    myData.node_id = 255;
+    myData.command = 99;
+    myData.amount = 0;
+    esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *)&myData, sizeof(myData));
+    if (result == ESP_OK) {
+      Serial.println("{\"status\":\"scan_sent\"}");
+    } else {
+      Serial.println("{\"status\":\"scan_error\", \"error_code\":" + String((int)result) + "}");
+    }
+    return;
+  }
+
+  // ------------------------------------------
+  // ตัวแปรคำสั่ง
+  // ------------------------------------------
+  int target_node = 0;
+  int cmd = 0;
+  int amount = 0;
+
+  // ==========================================
+  // 6.1 ตรวจสอบ Node
+  //
+  // รองรับ:
+  // feeder_1
+  // feeder_2
+  // feeder_3
+  //
+  // หรือ JSON:
+  // {"node_id":1}
+  // {"node_id": 1}
+  // ==========================================
+
+  // ---------- NODE 1 ----------
+  if (
+    input.indexOf("feeder_1") >= 0 ||
+    input.indexOf("\"node_id\":1") >= 0 ||
+    input.indexOf("\"node_id\": 1") >= 0
+  ) {
+
+    // ป้องกัน feeder_10 / feeder_11 / feeder_12
+    if (
+      input.indexOf("feeder_10") < 0 &&
+      input.indexOf("feeder_11") < 0 &&
+      input.indexOf("feeder_12") < 0
+    ) {
+
+      target_node = 1;
+    }
+  }
+
+  // ---------- NODE 2 ----------
+  if (
+    target_node == 0 &&
+    (
+      input.indexOf("feeder_2") >= 0 ||
+      input.indexOf("\"node_id\":2") >= 0 ||
+      input.indexOf("\"node_id\": 2") >= 0
+    )
+  ) {
+
+    target_node = 2;
+  }
+
+  // ---------- NODE 3 ----------
+  if (
+    target_node == 0 &&
+    (
+      input.indexOf("feeder_3") >= 0 ||
+      input.indexOf("\"node_id\":3") >= 0 ||
+      input.indexOf("\"node_id\": 3") >= 0
+    )
+  ) {
+
+    target_node = 3;
+  }
+
+
+  // ==========================================
+  // 6.2 ตรวจสอบ Command
+  //
+  // รองรับ:
+  // true
+  // false
+  //
+  // {"state":1}
+  // {"state":0}
+  //
+  // {"command":1}
+  // {"command":0}
+  //
+  // {"state":"on"}
+  // {"state":"off"}
+  // ==========================================
+
+  if (
+    input.indexOf("true") >= 0 ||
+    input.indexOf("\"state\":1") >= 0 ||
+    input.indexOf("\"state\": 1") >= 0 ||
+    input.indexOf("\"command\":1") >= 0 ||
+    input.indexOf("\"command\": 1") >= 0 ||
+    input.indexOf("\"state\":\"on\"") >= 0
+  ) {
+
+    cmd = 1;
+
+  }
+
+  else if (
+    input.indexOf("false") >= 0 ||
+    input.indexOf("\"state\":0") >= 0 ||
+    input.indexOf("\"state\": 0") >= 0 ||
+    input.indexOf("\"command\":0") >= 0 ||
+    input.indexOf("\"command\": 0") >= 0 ||
+    input.indexOf("\"state\":\"off\"") >= 0
+  ) {
+
+    cmd = 0;
+  }
+
+  else if (
+    input.indexOf("\"command\":2") >= 0 ||
+    input.indexOf("\"command\": 2") >= 0
+  ) {
+
+    cmd = 2;
+  }
+
+
+  // ==========================================
+  // 6.3 อ่าน amount
+  //
+  // ตัวอย่าง:
+  // {"amount":200}
+  // {"amount": 200}
+  // ==========================================
+
+  int amountIdx =
+    input.indexOf("\"amount\":");
+
+  if (amountIdx >= 0) {
+
+    String amtStr =
+      input.substring(
+        amountIdx + 9
+      );
+
+    amount = amtStr.toInt();
+  }
+
+
+  // ==========================================
+  // 6.4 แสดงคำสั่งที่อ่านได้
+  // ==========================================
+
+  Serial.println();
+  Serial.println("---------- COMMAND ----------");
+
+  Serial.print("Input: ");
+  Serial.println(input);
+
+  Serial.print("Node: ");
+  Serial.println(target_node);
+
+  Serial.print("Command: ");
+  Serial.println(cmd);
+
+  Serial.print("Amount: ");
+  Serial.println(amount);
+
+  Serial.println("-----------------------------");
+
+
+  // ==========================================
+  // 6.5 ถ้า Node ถูกต้อง
+  //     ส่ง ESP-NOW Broadcast
+  // ==========================================
+
+  if (target_node > 0) {
+
+    // ------------------------------------------
+    // ใส่ข้อมูลลง Struct
+    // ------------------------------------------
+    myData.node_id = target_node;
+    myData.command = cmd;
+    myData.amount = amount;
+
+    // ------------------------------------------
+    // ส่งข้อมูล
+    // ------------------------------------------
+    esp_err_t result =
+      esp_now_send(
+        broadcastAddress,
+        (uint8_t *)&myData,
+        sizeof(myData)
+      );
+
+
+    // ------------------------------------------
+    // ตรวจสอบผลการเรียกส่ง
+    // ------------------------------------------
+    if (result == ESP_OK) {
+
+      Serial.println(
+        "{\"status\":\"sent_espnow\", "
+        "\"node\":" +
+        String(target_node) +
+        ", \"cmd\":" +
+        String(cmd) +
+        ", \"amount\":" +
+        String(amount) +
+        "}"
+      );
+
+    }
+
+    else {
+
+      Serial.println(
+        "{\"status\":\"error_espnow\", "
+        "\"node\":" +
+        String(target_node) +
+        ", \"error_code\":" +
+        String((int)result) +
+        "}"
+      );
+    }
+
+  }
+
+  else {
+
+    Serial.println(
+      "{\"status\":\"ignored\", "
+      "\"msg\":\"Not a valid feeder command\"}"
+    );
+  }
+}
+
+
+// ==========================================
+// 7. Main Loop
+//
+// อ่าน Serial แบบ Non-blocking
+// ==========================================
+void loop() {
+
+  while (Serial.available() > 0) {
+
+    char c = (char)Serial.read();
+
+    // ----------------------------------------
+    // เมื่อเจอ Enter
+    // ----------------------------------------
+    if (c == '\n' || c == '\r') {
+
+      if (inputBuffer.length() > 0) {
+
+        processCommand(inputBuffer);
+
+        inputBuffer = "";
+      }
+    }
+
+    // ----------------------------------------
+    // เก็บตัวอักษร
+    // ----------------------------------------
+    else {
+
+      inputBuffer += c;
+    }
+  }
+}

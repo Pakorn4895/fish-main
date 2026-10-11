@@ -20,6 +20,7 @@ import SettingsPage from "./components/SettingsPage";
 import Login from "./components/Login";
 import Register from "./components/Register";
 import { Toaster } from "./components/ui/sonner";
+import { toast } from "sonner";
 import { Button } from "./components/ui/button";
 import {
   Dialog,
@@ -55,31 +56,24 @@ export interface Reservoir {
 }
 
 export interface Feeder {
-  isBluetooth?: boolean;
-  address?: string;
   id: string;
   name: string;
+  type?: "feeder" | "dispenser";
   status: boolean; // true = ON, false = OFF
-  remainingFeed: number; // in kg
-  capacity: number; // in kg
+  remainingFeed?: number; // in kg
+  capacity?: number; // in kg
+  remainingMolasses?: number; // in grams
+  capacityMolasses?: number; // in grams
+  remainingLime?: number; // in grams
+  capacityLime?: number; // in grams
   lastFed?: string; // e.g. "14:00 น."
-}
-
-export interface BluetoothDevice {
-  address: string;
-  name: string;
-}
-
-export interface ConnectedBluetoothDevice extends BluetoothDevice {
-  status: boolean;
 }
 
 export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [authPage, setAuthPage] = useState<"login" | "register">("login");
   const [currentPage, setCurrentPage] = useState<Page>("overview");
-  const { data: sensor, isConnected, isMockMode, isArduinoConnected, sendCommand } = useSensorData();
-  const [connectedBluetooth, setConnectedBluetooth] = useState<ConnectedBluetoothDevice[]>([]);
+  const { data: sensor, isConnected, isMockMode, isArduinoConnected, sendCommand, nodeStatus } = useSensorData();
 
   const [feeders, setFeeders] = useState<Feeder[]>(() => {
     const saved = localStorage.getItem("biofloc_feeders");
@@ -91,14 +85,79 @@ export default function App() {
       }
     }
     return [
-      { id: "f1", name: "เครื่องให้อาหาร A", status: false, remainingFeed: 8.5, capacity: 10, lastFed: "06:00 น." },
-      { id: "f2", name: "เครื่องให้อาหาร B", status: false, remainingFeed: 4.2, capacity: 10, lastFed: "14:00 น." },
+      { id: "1", name: "เครื่องให้อาหาร A", type: "feeder", status: false, remainingFeed: 8.5, capacity: 10, lastFed: "06:00 น." },
+      { id: "2", name: "เครื่องให้อาหาร B", type: "feeder", status: false, remainingFeed: 4.2, capacity: 10, lastFed: "14:00 น." },
     ];
   });
 
   useEffect(() => {
     localStorage.setItem("biofloc_feeders", JSON.stringify(feeders));
   }, [feeders]);
+
+  const [discoveredNodes, setDiscoveredNodes] = useState<string[]>([]);
+  const [registerNodeName, setRegisterNodeName] = useState("");
+  const [newNodeConfig, setNewNodeConfig] = useState({
+    type: "feeder",
+    capacity: "",
+    capacityMolasses: "",
+    capacityLime: ""
+  });
+
+  useEffect(() => {
+    const unknownNodes = Object.keys(nodeStatus).filter(id => 
+      nodeStatus[id] === true && !feeders.find(f => f.id === id)
+    );
+    if (unknownNodes.length > 0) {
+      setDiscoveredNodes(prev => {
+        const newNodes = unknownNodes.filter(id => !prev.includes(id));
+        return newNodes.length > 0 ? [...prev, ...newNodes] : prev;
+      });
+    }
+  }, [nodeStatus, feeders]);
+
+  const handleRegisterDiscoveredNode = (nodeId: string) => {
+    const name = registerNodeName.trim() || `อุปกรณ์ Node ${nodeId}`;
+    
+    if (newNodeConfig.type === "feeder") {
+      const cap = parseFloat(newNodeConfig.capacity) || 10000;
+      const newFeeder: Feeder = {
+        id: nodeId,
+        name: name,
+        type: "feeder",
+        status: false,
+        capacity: cap,
+        lastFed: "-",
+      };
+      setFeeders([...feeders, newFeeder]);
+    } else {
+      const capM = parseFloat(newNodeConfig.capacityMolasses) || 5000;
+      const capL = parseFloat(newNodeConfig.capacityLime) || 5000;
+      const newFeeder: Feeder = {
+        id: nodeId,
+        name: name,
+        type: "dispenser",
+        status: false,
+        capacityMolasses: capM,
+        capacityLime: capL,
+        lastFed: "-",
+      };
+      setFeeders([...feeders, newFeeder]);
+    }
+
+    setDiscoveredNodes(prev => prev.filter(id => id !== nodeId));
+    setRegisterNodeName("");
+    setNewNodeConfig({
+      type: "feeder",
+      capacity: "",
+      capacityMolasses: "",
+      capacityLime: ""
+    });
+    toast.success("เพิ่มอุปกรณ์สำเร็จ");
+  };
+
+  const handleIgnoreDiscoveredNode = (nodeId: string) => {
+    setDiscoveredNodes(prev => prev.filter(id => id !== nodeId));
+  };
 
   const [alerts, setAlerts] = useState<Alert[]>([]);
 
@@ -330,6 +389,97 @@ export default function App() {
 
   return (
     <div className="min-h-dvh bg-slate-50 flex flex-col md:flex-row md:h-screen">
+      {/* Auto-Discovery Dialog */}
+      <Dialog 
+        open={discoveredNodes.length > 0} 
+        onOpenChange={(open) => {
+          if (!open && discoveredNodes.length > 0) {
+             handleIgnoreDiscoveredNode(discoveredNodes[0]);
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-blue-600">
+              <Power className="w-5 h-5" /> ตรวจพบอุปกรณ์ใหม่ (Plug & Play)
+            </DialogTitle>
+            <DialogDescription>
+              ระบบตรวจพบ Node ที่เพิ่งออนไลน์ (Node ID: <strong className="text-slate-900">{discoveredNodes[0]}</strong>) แต่ยังไม่ได้ถูกเพิ่มในระบบ คุณต้องการเพิ่มอุปกรณ์นี้หรือไม่?
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 pt-4 max-h-[60vh] overflow-y-auto pr-2">
+            <div>
+              <Label htmlFor="newNodeName">ตั้งชื่ออุปกรณ์</Label>
+              <Input
+                id="newNodeName"
+                value={registerNodeName}
+                onChange={(e) => setRegisterNodeName(e.target.value)}
+                placeholder={`เช่น เครื่องให้อาหารบ่อ ${discoveredNodes[0]}`}
+                className="mt-1"
+              />
+            </div>
+            
+            <div>
+              <Label>ประเภทอุปกรณ์</Label>
+              <select 
+                className="flex h-10 w-full items-center justify-between rounded-md border border-slate-200 bg-white px-3 py-2 text-sm mt-1"
+                value={newNodeConfig.type}
+                onChange={(e) => setNewNodeConfig({ ...newNodeConfig, type: e.target.value })}
+              >
+                <option value="feeder">เครื่องให้อาหาร</option>
+                <option value="dispenser">เครื่องใส่สาร</option>
+              </select>
+            </div>
+
+            {newNodeConfig.type === "feeder" ? (
+              <>
+                <div>
+                  <Label>ความจุสูงสุดถังอาหาร (กรัม)</Label>
+                  <Input 
+                    type="number" 
+                    placeholder="10000" 
+                    value={newNodeConfig.capacity}
+                    onChange={(e) => setNewNodeConfig({ ...newNodeConfig, capacity: e.target.value })}
+                  />
+                  <p className="text-xs text-slate-400 mt-1">* ปริมาณคงเหลือจะอ่านจาก Loadcell อัตโนมัติ</p>
+                </div>
+              </>
+            ) : (
+              <>
+                <div>
+                  <Label>ความจุสูงสุดถังกากน้ำตาล (กรัม)</Label>
+                  <Input 
+                    type="number" 
+                    placeholder="5000" 
+                    value={newNodeConfig.capacityMolasses}
+                    onChange={(e) => setNewNodeConfig({ ...newNodeConfig, capacityMolasses: e.target.value })}
+                  />
+                </div>
+                <div>
+                  <Label>ความจุสูงสุดถังปูนขาว (กรัม)</Label>
+                  <Input 
+                    type="number" 
+                    placeholder="5000" 
+                    value={newNodeConfig.capacityLime}
+                    onChange={(e) => setNewNodeConfig({ ...newNodeConfig, capacityLime: e.target.value })}
+                  />
+                </div>
+                <p className="text-xs text-slate-400">* ปริมาณคงเหลือจะอ่านจาก Loadcell อัตโนมัติ</p>
+              </>
+            )}
+
+            <div className="flex justify-end gap-2 pt-2">
+              <Button variant="outline" onClick={() => handleIgnoreDiscoveredNode(discoveredNodes[0])}>
+                เพิกเฉย
+              </Button>
+              <Button onClick={() => handleRegisterDiscoveredNode(discoveredNodes[0])}>
+                เพิ่มเข้าระบบ
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
       {/* Desktop Sidebar */}
       <aside className="hidden w-64 shrink-0 flex-col border-r border-slate-200 bg-white md:flex z-10">
         <div className="p-6 border-b border-slate-200 shrink-0">
@@ -380,15 +530,19 @@ export default function App() {
 
         {/* Dynamic Pages */}
         <main className="flex-1 overflow-auto pb-safe">
-          {currentPage === "overview" && <Overview pond={selectedPond} reservoir={reservoir} feeders={feeders} />}
+          {currentPage === "overview" && (
+            <Overview 
+              pond={selectedPond} 
+              reservoir={reservoir} 
+              feeders={feeders} 
+            />
+          )}
           {currentPage === "water-quality" && <WaterQuality />}
           {currentPage === "analytics" && <Analytics />}
           {currentPage === "feeding" && (
             <Feeding 
               feeders={feeders} 
               setFeeders={setFeeders} 
-              connectedBluetooth={connectedBluetooth}
-              setConnectedBluetooth={setConnectedBluetooth}
             />
           )}
           {currentPage === "device-control" && (
